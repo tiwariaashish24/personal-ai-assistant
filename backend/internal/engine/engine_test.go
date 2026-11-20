@@ -113,3 +113,34 @@ func TestSystemCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestHindiCommands(t *testing.T) {
+	assistant, root := newTestEngine(t)
+	assistant.launch = func(name string) error {
+		if name != "chrome" {
+			t.Fatalf("launch called for %q", name)
+		}
+		return nil
+	}
+
+	if _, err := assistant.Execute("क्रोम खोलो"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := assistant.Execute("फाइल बनाओ नोट्स.txt नमस्ते दुनिया"); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(root, "नोट्स.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "नमस्ते दुनिया" {
+		t.Fatalf("file contains %q", content)
+	}
+	result, err := assistant.Execute("फाइल पढ़ो नोट्स.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "नमस्ते दुनिया" {
+		t.Fatalf("read returned %q", result.Output)
+	}
+}

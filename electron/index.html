@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https:; img-src 'self' data:"
+    />
+    <title>JARVIS Voice Assistant</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="renderer.js" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="JARVIS">
+          <span class="brand-mark" aria-hidden="true">J</span>
+          <span>JARVIS <small>PERSONAL ASSISTANT</small></span>
+        </div>
+        <div class="topbar-actions">
+          <label class="language-picker">
+            <span class="sr-only">Speech language</span>
+            <select id="language">
+              <option value="en-US">English</option>
+              <option value="hi-IN">हिन्दी</option>
+            </select>
+          </label>
+          <button id="workspace-button" class="workspace-button" type="button">Workspace</button>
+        </div>
+      </header>
+
+      <section class="assistant-panel" aria-labelledby="assistant-title">
+        <div class="orb-wrap" aria-hidden="true">
+          <div id="orb" class="orb">
+            <span></span>
+          </div>
+        </div>
+        <p id="status" class="status" role="status" aria-live="polite">Starting JARVIS…</p>
+        <h1 id="assistant-title">At your service.</h1>
+        <p class="subtitle">Say <strong>“Hey Jarvis”</strong> to give a command.</p>
+
+        <button id="microphone-button" class="microphone-button" type="button" disabled>
+          <span class="mic-icon" aria-hidden="true"></span>
+          <span id="microphone-label">Start listening</span>
+        </button>
+        <p class="hint">Listening stays on while this app is open. Say “stop listening” to pause.</p>
+      </section>
+
+      <section class="command-panel" aria-label="Command input">
+        <form id="command-form">
+          <label class="sr-only" for="command-input">Type a command</label>
+          <input
+            id="command-input"
+            type="text"
+            autocomplete="off"
+            placeholder="Type a command…"
+          />
+          <button type="submit">Send</button>
+        </form>
+        <p class="examples">
+          Try: <button type="button" data-command="open notepad">open notepad</button>
+          <span>·</span>
+          <button type="button" data-command="system">system status</button>
+          <span>·</span>
+          <button type="button" data-command="help">help</button>
+        </p>
+      </section>
+
+      <section class="conversation-panel" aria-labelledby="conversation-title">
+        <div class="section-heading">
+          <h2 id="conversation-title">Conversation</h2>
+          <button id="clear-button" class="clear-button" type="button">Clear</button>
+        </div>
+        <div id="conversation" class="conversation" aria-live="polite">
+          <p class="empty-state">Your recent commands and JARVIS responses will appear here.</p>
+        </div>
+      </section>
+
+      <footer>
+        <span class="privacy-indicator"><i></i> <span id="microphone-privacy">Microphone is off until you start listening</span></span>
+        <span id="workspace-path" class="workspace-path"></span>
+      </footer>
+    </main>
+  </body>
+</html>

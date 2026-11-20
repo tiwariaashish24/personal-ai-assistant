@@ -19,7 +19,10 @@ const helpText = `Commands:
   exit                          Quit the assistant
 
 Quote paths or text containing spaces with double quotes. File paths are relative
-to the workspace and cannot access files outside it.`
+to the workspace and cannot access files outside it.
+
+Hindi examples: क्रोम खोलो, सिस्टम जानकारी, फाइल बनाओ <नाम> <टेक्स्ट>,
+फाइल पढ़ो <नाम>.`
 
 var ErrUnknownCommand = errors.New("unknown command")
 
@@ -54,6 +57,7 @@ func New(workspace string) (*Engine, error) {
 }
 
 func (e *Engine) Execute(input string) (Result, error) {
+	input = normalizeHindiCommand(input)
 	fields, err := parseFields(input)
 	if err != nil {
 		return Result{}, err
@@ -113,6 +117,68 @@ func (e *Engine) Execute(input string) (Result, error) {
 	default:
 		return Result{}, fmt.Errorf("%w: %s (type help for commands)", ErrUnknownCommand, fields[0])
 	}
+}
+
+func normalizeHindiCommand(input string) string {
+	command := strings.ToLower(strings.TrimSpace(input))
+	phrases := map[string]string{
+		"मदद":    "help",
+		"सहायता": "help",
+		"सिस्टम जानकारी": "system",
+		"सिस्टम दिखाओ":   "system",
+		"बाहर निकलो":     "exit",
+		"बंद हो जाओ":     "exit",
+	}
+	if translated, ok := phrases[command]; ok {
+		return translated
+	}
+
+	appNames := map[string]string{
+		"क्रोम":               "chrome",
+		"गूगल क्रोम":          "chrome",
+		"वीएस कोड":            "vscode",
+		"विजुअल स्टूडियो कोड": "vscode",
+		"नोटपैड":              "notepad",
+	}
+	if strings.HasSuffix(command, " खोलो") {
+		appName := strings.TrimSpace(strings.TrimSuffix(command, " खोलो"))
+		if app, ok := appNames[appName]; ok {
+			return "open " + app
+		}
+	}
+
+	for _, alias := range []struct {
+		prefix string
+		target string
+	}{
+		{prefix: "फाइल पढ़ो ", target: "read"},
+		{prefix: "फ़ाइल पढ़ो ", target: "read"},
+		{prefix: "फाइल हटाओ ", target: "delete"},
+		{prefix: "फ़ाइल हटाओ ", target: "delete"},
+	} {
+		if strings.HasPrefix(command, alias.prefix) {
+			return alias.target + " " + strings.TrimSpace(strings.TrimPrefix(command, alias.prefix))
+		}
+	}
+
+	for _, alias := range []struct {
+		prefix string
+		target string
+	}{
+		{prefix: "फाइल बनाओ ", target: "create"},
+		{prefix: "फ़ाइल बनाओ ", target: "create"},
+		{prefix: "फाइल में जोड़ो ", target: "append"},
+		{prefix: "फ़ाइल में जोड़ो ", target: "append"},
+	} {
+		if strings.HasPrefix(command, alias.prefix) {
+			nameAndText := strings.TrimSpace(strings.TrimPrefix(command, alias.prefix))
+			name, text, ok := strings.Cut(nameAndText, " ")
+			if ok && name != "" && strings.TrimSpace(text) != "" {
+				return alias.target + " " + name + " " + strings.TrimSpace(text)
+			}
+		}
+	}
+	return input
 }
 
 func (e *Engine) create(name, content string) (Result, error) {
