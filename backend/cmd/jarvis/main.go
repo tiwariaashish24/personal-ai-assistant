@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"jarvis/internal/engine"
 	"jarvis/internal/logx"
@@ -22,6 +23,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := assistant.Close(); err != nil {
+			logx.Error("close assistant: %v", err)
+		}
+	}()
 
 	if *stdio {
 		if err := runStdio(assistant); err != nil {
@@ -40,7 +46,19 @@ func main() {
 			break
 		}
 
-		result, err := assistant.Execute(scanner.Text())
+		command := scanner.Text()
+		result, err := assistant.Execute(command)
+		if err == nil && result.Confirmation != "" {
+			fmt.Printf("%s [y/N]: ", result.Confirmation)
+			if !scanner.Scan() {
+				break
+			}
+			if strings.EqualFold(strings.TrimSpace(scanner.Text()), "y") {
+				result, err = assistant.ExecuteConfirmed(command)
+			} else {
+				result.Output = "Cancelled. No changes were made."
+			}
+		}
 		if err != nil {
 			logx.Error("command failed: %v", err)
 			fmt.Fprintln(os.Stderr, "Error:", err)
@@ -64,12 +82,14 @@ func main() {
 type stdioRequest struct {
 	Command           string `json:"command"`
 	ClearConversation bool   `json:"clearConversation,omitempty"`
+	Confirmed         bool   `json:"confirmed,omitempty"`
 }
 
 type stdioResponse struct {
-	Output string `json:"output,omitempty"`
-	Exit   bool   `json:"exit,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Output       string `json:"output,omitempty"`
+	Exit         bool   `json:"exit,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Confirmation string `json:"confirmation,omitempty"`
 }
 
 func runStdio(assistant *engine.Engine) error {
@@ -84,13 +104,20 @@ func runStdio(assistant *engine.Engine) error {
 		} else if request.ClearConversation {
 			assistant.ClearConversation()
 		} else {
-			result, err := assistant.Execute(request.Command)
+			var result engine.Result
+			var err error
+			if request.Confirmed {
+				result, err = assistant.ExecuteConfirmed(request.Command)
+			} else {
+				result, err = assistant.Execute(request.Command)
+			}
 			if err != nil {
 				logx.Error("command failed: %v", err)
 				response.Error = err.Error()
 			} else {
 				response.Output = result.Output
 				response.Exit = result.Exit
+				response.Confirmation = result.Confirmation
 			}
 		}
 		if err := json.NewEncoder(writer).Encode(response); err != nil {

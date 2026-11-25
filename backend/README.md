@@ -32,3 +32,13 @@ information; arbitrary shell commands and AI file deletion are not supported.
 The AI can also scaffold a React/Vite portfolio project inside the workspace
 and open that folder in VS Code; dependencies are installed separately with
 `npm install`.
+
+Permission policies persist in SQLite under the OS user configuration directory
+in `JARVIS/jarvis.db`; set `JARVIS_DB_PATH` to override it. The selected
+workspace is approved for reading, creating, and appending files. Add or revoke
+read-only folder access with
+`permission read add "<absolute folder>"` and
+`permission read remove "<absolute folder>"`; inspect policies with
+`permissions`. File deletion always requires confirmation. Gmail, email
+sending, and payments are unavailable until their integrations and account
+authorization are implemented.

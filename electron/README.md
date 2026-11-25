@@ -57,3 +57,19 @@ inside the selected workspace; and system information. AI cannot run shell
 commands or delete files. A React portfolio starter can be scaffolded inside
 the workspace and opened directly in VS Code; run `npm install` in that folder
 before starting its Vite development server.
+
+## Permissions
+
+Permission decisions are stored in SQLite at your OS user configuration
+directory under `JARVIS/jarvis.db`; set `JARVIS_DB_PATH` to override it. The
+selected workspace is approved for reads and file creation/appending, and the
+supported application allowlist can always be opened. Use `permissions` to
+review saved policies. Approve an additional read-only folder with
+`permission read add "C:\path\to\folder"` and revoke it with
+`permission read remove "C:\path\to\folder"`. External folder access is
+read-only; writes remain restricted to the selected workspace.
+
+Every file deletion asks for confirmation in the desktop app (or the CLI) and
+never deletes before confirmation. JARVIS currently has no Gmail, email-sending,
+or payment integration; those actions remain unavailable until account/OAuth
+and service integrations are implemented.

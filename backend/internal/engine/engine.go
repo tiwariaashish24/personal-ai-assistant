@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"jarvis/internal/config"
+	"jarvis/internal/permissions"
 )
 
 const helpText = `Commands:
@@ -17,6 +18,9 @@ const helpText = `Commands:
   read <file>                   Read a file
   append <file> <text>          Append text to a file
   delete <file>                 Delete a file
+  permissions                   Show saved permission policies
+  permission read add <folder>  Approve a folder for file reads
+  permission read remove <folder> Revoke a folder's read permission
   system                        Show CPU, memory, and battery information
   help                          Show this help
   exit                          Quit the assistant
@@ -31,14 +35,16 @@ Hindi examples: क्रोम खोलो, सिस्टम जानका
 var ErrUnknownCommand = errors.New("unknown command")
 
 type Result struct {
-	Output string
-	Exit   bool
+	Output       string
+	Exit         bool
+	Confirmation string
 }
 
 type Engine struct {
-	root   string
-	launch func(string, ...string) error
-	ai     *aiAssistant
+	root        string
+	launch      func(string, ...string) error
+	ai          *aiAssistant
+	permissions *permissions.Store
 }
 
 func (e *Engine) ClearConversation() {
@@ -64,10 +70,39 @@ func New(workspace string) (*Engine, error) {
 		return nil, errors.New("workspace must be a directory")
 	}
 
-	return &Engine{root: root, launch: startApplication, ai: newAIAssistant(config.Load())}, nil
+	cfg := config.Load()
+	permissionStore, err := permissions.Open(cfg.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("initialize permissions: %w", err)
+	}
+	if err := permissionStore.Initialize(root); err != nil {
+		_ = permissionStore.Close()
+		return nil, fmt.Errorf("initialize permissions: %w", err)
+	}
+	return &Engine{
+		root:        root,
+		launch:      startApplication,
+		ai:          newAIAssistant(cfg),
+		permissions: permissionStore,
+	}, nil
 }
 
 func (e *Engine) Execute(input string) (Result, error) {
+	return e.execute(input, false)
+}
+
+func (e *Engine) ExecuteConfirmed(input string) (Result, error) {
+	return e.execute(input, true)
+}
+
+func (e *Engine) Close() error {
+	if e.permissions == nil {
+		return nil
+	}
+	return e.permissions.Close()
+}
+
+func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 	originalInput := input
 	input = normalizeHindiCommand(input)
 	fields, err := parseFields(input)
@@ -97,6 +132,13 @@ func (e *Engine) Execute(input string) (Result, error) {
 		if app != "chrome" && app != "vscode" && app != "notepad" {
 			return Result{}, errors.New("app must be chrome, vscode, or notepad")
 		}
+		allowed, err := e.permissionAllowed("open_app", "*")
+		if err != nil {
+			return Result{}, err
+		}
+		if !allowed {
+			return Result{}, errors.New("opening applications is not permitted")
+		}
 		if err := e.launch(app); err != nil {
 			return Result{}, fmt.Errorf("open %s: %w", app, err)
 		}
@@ -121,7 +163,14 @@ func (e *Engine) Execute(input string) (Result, error) {
 		if len(fields) != 2 {
 			return e.respondToAI(originalInput)
 		}
-		return e.delete(fields[1])
+		return e.delete(fields[1], confirmed)
+	case "permissions":
+		if len(fields) != 1 {
+			return Result{}, errors.New("usage: permissions")
+		}
+		return e.listPermissions()
+	case "permission":
+		return e.managePermission(fields)
 	case "system":
 		if len(fields) != 1 {
 			return e.respondToAI(originalInput)
@@ -135,6 +184,73 @@ func (e *Engine) Execute(input string) (Result, error) {
 			return Result{}, fmt.Errorf("%w: %s (type help for commands)", ErrUnknownCommand, fields[0])
 		}
 		return e.respondToAI(originalInput)
+	}
+}
+
+func (e *Engine) permissionAllowed(action, resource string) (bool, error) {
+	decision, err := e.permissions.Decision(action, resource)
+	if err != nil {
+		return false, err
+	}
+	switch decision {
+	case permissions.Allow:
+		return true, nil
+	case permissions.Confirm:
+		return false, fmt.Errorf("%s requires confirmation", action)
+	default:
+		return false, nil
+	}
+}
+
+func (e *Engine) listPermissions() (Result, error) {
+	entries, err := e.permissions.List()
+	if err != nil {
+		return Result{}, err
+	}
+	var output strings.Builder
+	output.WriteString("Saved permissions:\n")
+	for _, entry := range entries {
+		fmt.Fprintf(&output, "  %-12s %-7s %s\n", entry.Action, entry.Decision, entry.Resource)
+	}
+	output.WriteString("  Gmail, email sending, and payments are unavailable until their integrations are configured.")
+	return Result{Output: output.String()}, nil
+}
+
+func (e *Engine) managePermission(fields []string) (Result, error) {
+	if len(fields) != 4 || !strings.EqualFold(fields[1], "read") {
+		return Result{}, errors.New("usage: permission read <add|remove> <folder>")
+	}
+	folder, err := filepath.Abs(fields[3])
+	if err != nil {
+		return Result{}, fmt.Errorf("resolve read folder: %w", err)
+	}
+	folder = filepath.Clean(folder)
+	if resolved, resolveErr := filepath.EvalSymlinks(folder); resolveErr == nil {
+		folder = resolved
+	} else if strings.EqualFold(fields[2], "add") {
+		return Result{}, fmt.Errorf("resolve read folder: %w", resolveErr)
+	}
+
+	switch strings.ToLower(fields[2]) {
+	case "add":
+		info, err := os.Stat(folder)
+		if err != nil {
+			return Result{}, fmt.Errorf("inspect read folder: %w", err)
+		}
+		if !info.IsDir() {
+			return Result{}, errors.New("read permission requires a directory")
+		}
+		if err := e.permissions.Set("read_file", folder, permissions.Allow); err != nil {
+			return Result{}, err
+		}
+		return Result{Output: "Approved reads from " + folder + "."}, nil
+	case "remove":
+		if err := e.permissions.Set("read_file", folder, permissions.Deny); err != nil {
+			return Result{}, err
+		}
+		return Result{Output: "Revoked read permission for " + folder + "."}, nil
+	default:
+		return Result{}, errors.New("permission action must be add or remove")
 	}
 }
 
@@ -275,6 +391,13 @@ func (e *Engine) createReactProject(name string) (string, error) {
 	name, err := normalizeReactProjectName(name)
 	if err != nil {
 		return "", err
+	}
+	allowed, err := e.permissionAllowed("create_file", e.root)
+	if err != nil {
+		return "", err
+	}
+	if !allowed {
+		return "", errors.New("creating files is not permitted in this workspace")
 	}
 	relative, err := e.relativePath(name)
 	if err != nil {
@@ -481,6 +604,13 @@ func normalizeHindiCommand(input string) string {
 }
 
 func (e *Engine) create(name, content string) (Result, error) {
+	allowed, err := e.permissionAllowed("create_file", e.root)
+	if err != nil {
+		return Result{}, err
+	}
+	if !allowed {
+		return Result{}, errors.New("creating files is not permitted in this workspace")
+	}
 	path, err := e.newFilePath(name)
 	if err != nil {
 		return Result{}, err
@@ -513,9 +643,16 @@ func (e *Engine) create(name, content string) (Result, error) {
 }
 
 func (e *Engine) read(name string) (Result, error) {
-	path, err := e.existingFilePath(name)
+	path, err := e.readableFilePath(name)
 	if err != nil {
 		return Result{}, err
+	}
+	decision, err := e.permissions.ReadFolderDecision(path)
+	if err != nil {
+		return Result{}, err
+	}
+	if decision != permissions.Allow {
+		return Result{}, fmt.Errorf("reading %s is not permitted; approve its folder with permission read add", name)
 	}
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -525,6 +662,13 @@ func (e *Engine) read(name string) (Result, error) {
 }
 
 func (e *Engine) append(name, content string) (Result, error) {
+	allowed, err := e.permissionAllowed("append_file", e.root)
+	if err != nil {
+		return Result{}, err
+	}
+	if !allowed {
+		return Result{}, errors.New("appending files is not permitted in this workspace")
+	}
 	path, err := e.existingFilePath(name)
 	if err != nil {
 		return Result{}, err
@@ -544,15 +688,51 @@ func (e *Engine) append(name, content string) (Result, error) {
 	return Result{Output: "Updated " + name + "."}, nil
 }
 
-func (e *Engine) delete(name string) (Result, error) {
+func (e *Engine) delete(name string, confirmed bool) (Result, error) {
 	path, err := e.existingFilePath(name)
 	if err != nil {
 		return Result{}, err
+	}
+	decision, err := e.permissions.Decision("delete_file", e.root)
+	if err != nil {
+		return Result{}, err
+	}
+	if decision == permissions.Deny {
+		return Result{}, errors.New("deleting files is not permitted in this workspace")
+	}
+	if decision == permissions.Confirm && !confirmed {
+		return Result{Confirmation: fmt.Sprintf("Delete %q? This cannot be undone.", name)}, nil
 	}
 	if err := os.Remove(path); err != nil {
 		return Result{}, fmt.Errorf("delete file: %w", err)
 	}
 	return Result{Output: "Deleted " + name + "."}, nil
+}
+
+func (e *Engine) readableFilePath(name string) (string, error) {
+	var path string
+	if filepath.IsAbs(name) {
+		linkInfo, err := os.Lstat(name)
+		if err != nil {
+			return "", fmt.Errorf("inspect file: %w", err)
+		}
+		if linkInfo.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("symbolic links are not supported")
+		}
+		path, err = filepath.EvalSymlinks(name)
+		if err != nil {
+			return "", fmt.Errorf("resolve file: %w", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return "", fmt.Errorf("inspect file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", errors.New("path must refer to a regular file")
+		}
+		return path, nil
+	}
+	return e.existingFilePath(name)
 }
 
 func (e *Engine) newFilePath(name string) (string, error) {

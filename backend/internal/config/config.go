@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -31,7 +32,7 @@ func Load() *Config {
 
 	cfg := &Config{
 		Addr:           envOr("JARVIS_API_ADDR", "127.0.0.1:8080"),
-		DBPath:         envOr("JARVIS_DB_PATH", "jarvis.db"),
+		DBPath:         envOr("JARVIS_DB_PATH", defaultDBPath()),
 		NodeServiceURL: envOr("JARVIS_NODE_URL", "http://127.0.0.1:8787"),
 		EnableVoice:    envOr("JARVIS_VOICE", "true") != "false",
 		AIProvider:     envOr("JARVIS_AI_PROVIDER", "ollama"),
@@ -40,6 +41,14 @@ func Load() *Config {
 		OpenAIKey:      os.Getenv("OPENAI_API_KEY"),
 	}
 	return cfg
+}
+
+func defaultDBPath() string {
+	directory, err := os.UserConfigDir()
+	if err != nil {
+		return "jarvis.db"
+	}
+	return filepath.Join(directory, "JARVIS", "jarvis.db")
 }
 
 func envOr(key, fallback string) string {

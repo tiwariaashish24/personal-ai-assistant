@@ -90,11 +90,28 @@ function sendAssistantRequest(request) {
   });
 }
 
-function executeCommand(command) {
+async function executeCommand(command) {
   if (typeof command !== "string" || command.trim() === "" || command.length > 4096) {
-    return Promise.reject(new Error("Enter a command up to 4096 characters long."));
+    throw new Error("Enter a command up to 4096 characters long.");
   }
-  return sendAssistantRequest({ command });
+  const result = await sendAssistantRequest({ command });
+  if (!result.confirmation) {
+    return result;
+  }
+  const confirmation = await dialog.showMessageBox(mainWindow, {
+    type: "warning",
+    title: "Confirm file deletion",
+    message: result.confirmation,
+    detail: "This action cannot be undone.",
+    buttons: ["Cancel", "Delete"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  if (confirmation.response !== 1) {
+    return { output: "Cancelled. No changes were made." };
+  }
+  return sendAssistantRequest({ command, confirmed: true });
 }
 
 function isTrustedWindow(event) {

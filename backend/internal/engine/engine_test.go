@@ -11,10 +11,16 @@ import (
 func newTestEngine(t *testing.T) (*Engine, string) {
 	t.Helper()
 	root := t.TempDir()
+	t.Setenv("JARVIS_DB_PATH", filepath.Join(t.TempDir(), "permissions.db"))
 	assistant, err := New(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := assistant.Close(); err != nil {
+			t.Errorf("close assistant: %v", err)
+		}
+	})
 	return assistant, root
 }
 
@@ -38,11 +44,50 @@ func TestFileCommands(t *testing.T) {
 		t.Fatalf("read returned %q", result.Output)
 	}
 
-	if _, err := assistant.Execute(`delete "notes file.txt"`); err != nil {
+	result, err = assistant.Execute(`delete "notes file.txt"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Confirmation == "" {
+		t.Fatal("expected a confirmation before deleting a file")
+	}
+	if _, err := os.Stat(filepath.Join(root, "notes file.txt")); err != nil {
+		t.Fatalf("file was deleted before confirmation: %v", err)
+	}
+	if _, err := assistant.ExecuteConfirmed(`delete "notes file.txt"`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "notes file.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected file to be deleted, stat error: %v", err)
+	}
+}
+
+func TestReadNeedsApprovedFolderAndCanBeRevoked(t *testing.T) {
+	assistant, _ := newTestEngine(t)
+	folder := t.TempDir()
+	path := filepath.Join(folder, "private.txt")
+	if err := os.WriteFile(path, []byte("approved"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	quotedPath := `"` + path + `"`
+	if _, err := assistant.Execute("read " + quotedPath); err == nil {
+		t.Fatal("expected unapproved folder read to be rejected")
+	}
+	if _, err := assistant.Execute(`permission read add "` + folder + `"`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := assistant.Execute("read " + quotedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "approved" {
+		t.Fatalf("read returned %q", result.Output)
+	}
+	if _, err := assistant.Execute(`permission read remove "` + folder + `"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := assistant.Execute("read " + quotedPath); err == nil {
+		t.Fatal("expected revoked folder read to be rejected")
 	}
 }
 
