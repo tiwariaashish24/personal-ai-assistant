@@ -62,7 +62,8 @@ func main() {
 }
 
 type stdioRequest struct {
-	Command string `json:"command"`
+	Command           string `json:"command"`
+	ClearConversation bool   `json:"clearConversation,omitempty"`
 }
 
 type stdioResponse struct {
@@ -80,6 +81,8 @@ func runStdio(assistant *engine.Engine) error {
 		response := stdioResponse{}
 		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
 			response.Error = fmt.Sprintf("invalid request: %v", err)
+		} else if request.ClearConversation {
+			assistant.ClearConversation()
 		} else {
 			result, err := assistant.Execute(request.Command)
 			if err != nil {

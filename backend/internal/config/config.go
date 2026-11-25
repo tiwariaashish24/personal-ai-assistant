@@ -15,6 +15,14 @@ type Config struct {
 	NodeServiceURL string
 	// EnableVoice enables the voice pipeline status endpoints.
 	EnableVoice bool
+	// AIProvider selects ollama or openai for natural-language requests.
+	AIProvider string
+	// AIBaseURL overrides the selected provider's OpenAI-compatible API URL.
+	AIBaseURL string
+	// AIModel overrides the provider's default model.
+	AIModel string
+	// OpenAIKey is the API key used only by the OpenAI provider.
+	OpenAIKey string
 }
 
 func Load() *Config {
@@ -26,6 +34,10 @@ func Load() *Config {
 		DBPath:         envOr("JARVIS_DB_PATH", "jarvis.db"),
 		NodeServiceURL: envOr("JARVIS_NODE_URL", "http://127.0.0.1:8787"),
 		EnableVoice:    envOr("JARVIS_VOICE", "true") != "false",
+		AIProvider:     envOr("JARVIS_AI_PROVIDER", "ollama"),
+		AIBaseURL:      os.Getenv("JARVIS_AI_BASE_URL"),
+		AIModel:        os.Getenv("JARVIS_AI_MODEL"),
+		OpenAIKey:      os.Getenv("OPENAI_API_KEY"),
 	}
 	return cfg
 }

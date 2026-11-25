@@ -1,11 +1,14 @@
 package engine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"jarvis/internal/config"
 )
 
 const helpText = `Commands:
@@ -20,6 +23,7 @@ const helpText = `Commands:
 
 Quote paths or text containing spaces with double quotes. File paths are relative
 to the workspace and cannot access files outside it.
+Natural-language requests and conversation use the configured AI provider.
 
 Hindi examples: क्रोम खोलो, सिस्टम जानकारी, फाइल बनाओ <नाम> <टेक्स्ट>,
 फाइल पढ़ो <नाम>.`
@@ -33,7 +37,14 @@ type Result struct {
 
 type Engine struct {
 	root   string
-	launch func(string) error
+	launch func(string, ...string) error
+	ai     *aiAssistant
+}
+
+func (e *Engine) ClearConversation() {
+	if e.ai != nil {
+		e.ai.history = nil
+	}
 }
 
 func New(workspace string) (*Engine, error) {
@@ -53,10 +64,11 @@ func New(workspace string) (*Engine, error) {
 		return nil, errors.New("workspace must be a directory")
 	}
 
-	return &Engine{root: root, launch: startApplication}, nil
+	return &Engine{root: root, launch: startApplication, ai: newAIAssistant(config.Load())}, nil
 }
 
 func (e *Engine) Execute(input string) (Result, error) {
+	originalInput := input
 	input = normalizeHindiCommand(input)
 	fields, err := parseFields(input)
 	if err != nil {
@@ -79,7 +91,7 @@ func (e *Engine) Execute(input string) (Result, error) {
 		return Result{Output: "Goodbye.", Exit: true}, nil
 	case "open":
 		if len(fields) != 2 {
-			return Result{}, errors.New("usage: open <chrome|vscode|notepad>")
+			return e.respondToAI(originalInput)
 		}
 		app := strings.ToLower(fields[1])
 		if app != "chrome" && app != "vscode" && app != "notepad" {
@@ -90,33 +102,320 @@ func (e *Engine) Execute(input string) (Result, error) {
 		}
 		return Result{Output: "Opening " + app + "."}, nil
 	case "create":
-		if len(fields) < 3 {
-			return Result{}, errors.New("usage: create <file> <text>")
+		if len(fields) < 3 || (len(fields) > 3 && originalInput == input) ||
+			(len(fields) > 1 && (strings.EqualFold(fields[1], "a") || strings.EqualFold(fields[1], "an") || strings.EqualFold(fields[1], "the"))) {
+			return e.respondToAI(originalInput)
 		}
 		return e.create(fields[1], strings.Join(fields[2:], " "))
 	case "read":
 		if len(fields) != 2 {
-			return Result{}, errors.New("usage: read <file>")
+			return e.respondToAI(originalInput)
 		}
 		return e.read(fields[1])
 	case "append":
-		if len(fields) < 3 {
-			return Result{}, errors.New("usage: append <file> <text>")
+		if len(fields) < 3 || (len(fields) > 3 && originalInput == input) {
+			return e.respondToAI(originalInput)
 		}
 		return e.append(fields[1], strings.Join(fields[2:], " "))
 	case "delete":
 		if len(fields) != 2 {
-			return Result{}, errors.New("usage: delete <file>")
+			return e.respondToAI(originalInput)
 		}
 		return e.delete(fields[1])
 	case "system":
 		if len(fields) != 1 {
-			return Result{}, errors.New("usage: system")
+			return e.respondToAI(originalInput)
 		}
 		return Result{Output: systemSummary(platformStats())}, nil
 	default:
-		return Result{}, fmt.Errorf("%w: %s (type help for commands)", ErrUnknownCommand, fields[0])
+		if strings.EqualFold(fields[0], "run") {
+			return Result{}, fmt.Errorf("%w: %s (type help for commands)", ErrUnknownCommand, fields[0])
+		}
+		if e.ai == nil {
+			return Result{}, fmt.Errorf("%w: %s (type help for commands)", ErrUnknownCommand, fields[0])
+		}
+		return e.respondToAI(originalInput)
 	}
+}
+
+func (e *Engine) respondToAI(input string) (Result, error) {
+	if e.ai == nil {
+		return Result{}, fmt.Errorf("%w: type help for commands", ErrUnknownCommand)
+	}
+	reply, err := e.ai.respond(input, e.runAITool)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Output: reply}, nil
+}
+
+func (e *Engine) runAITool(name string, arguments json.RawMessage) (string, error) {
+	switch name {
+	case "open_app":
+		var args struct {
+			App       *string `json:"app"`
+			Directory *string `json:"directory"`
+		}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.App == nil {
+			return "", errors.New("app is required")
+		}
+		if *args.App != "chrome" && *args.App != "vscode" && *args.App != "notepad" {
+			return "", errors.New("app must be chrome, vscode, or notepad")
+		}
+		var launchArgs []string
+		if args.Directory != nil {
+			if *args.App != "vscode" {
+				return "", errors.New("a directory can only be opened with vscode")
+			}
+			directory, err := e.workspaceDirectory(*args.Directory)
+			if err != nil {
+				return "", err
+			}
+			launchArgs = append(launchArgs, directory)
+		}
+		if err := e.launch(*args.App, launchArgs...); err != nil {
+			return "", fmt.Errorf("open %s: %w", *args.App, err)
+		}
+		return "Opening " + *args.App + ".", nil
+	case "create_file":
+		var args struct {
+			File *string `json:"file"`
+			Text *string `json:"text"`
+		}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.File == nil || *args.File == "" {
+			return "", errors.New("file is required")
+		}
+		if args.Text == nil {
+			return "", errors.New("text is required")
+		}
+		result, err := e.create(*args.File, *args.Text)
+		return result.Output, err
+	case "read_file":
+		var args struct {
+			File *string `json:"file"`
+		}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.File == nil || *args.File == "" {
+			return "", errors.New("file is required")
+		}
+		result, err := e.read(*args.File)
+		return result.Output, err
+	case "append_file":
+		var args struct {
+			File *string `json:"file"`
+			Text *string `json:"text"`
+		}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.File == nil || *args.File == "" {
+			return "", errors.New("file is required")
+		}
+		if args.Text == nil {
+			return "", errors.New("text is required")
+		}
+		result, err := e.append(*args.File, *args.Text)
+		return result.Output, err
+	case "create_react_project":
+		var args struct {
+			ProjectName *string `json:"project_name"`
+		}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.ProjectName == nil {
+			return "", errors.New("project_name is required")
+		}
+		return e.createReactProject(*args.ProjectName)
+	case "system_info":
+		var args struct{}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		return systemSummary(platformStats()), nil
+	default:
+		return "", fmt.Errorf("unsupported AI tool %q", name)
+	}
+}
+
+func (e *Engine) workspaceDirectory(name string) (string, error) {
+	if name == "." {
+		return e.root, nil
+	}
+	relative, err := e.relativePath(name)
+	if err != nil {
+		return "", err
+	}
+	path, err := filepath.EvalSymlinks(filepath.Join(e.root, relative))
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace directory: %w", err)
+	}
+	if !withinRoot(e.root, path) {
+		return "", errors.New("directory must stay inside the workspace")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect workspace directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("path must refer to a directory")
+	}
+	return path, nil
+}
+
+func (e *Engine) createReactProject(name string) (string, error) {
+	name, err := normalizeReactProjectName(name)
+	if err != nil {
+		return "", err
+	}
+	relative, err := e.relativePath(name)
+	if err != nil {
+		return "", err
+	}
+	projectPath := filepath.Join(e.root, relative)
+	if err := os.Mkdir(projectPath, 0755); err != nil {
+		return "", fmt.Errorf("create project directory: %w", err)
+	}
+	sourcePath := filepath.Join(projectPath, "src")
+	if err := os.Mkdir(sourcePath, 0755); err != nil {
+		return "", fmt.Errorf("create project source directory: %w", err)
+	}
+
+	packageJSON, err := json.MarshalIndent(struct {
+		Name         string            `json:"name"`
+		Version      string            `json:"version"`
+		Private      bool              `json:"private"`
+		Type         string            `json:"type"`
+		Scripts      map[string]string `json:"scripts"`
+		Dependencies map[string]string `json:"dependencies"`
+		DevDeps      map[string]string `json:"devDependencies"`
+	}{
+		Name:         name,
+		Version:      "1.0.0",
+		Private:      true,
+		Type:         "module",
+		Scripts:      map[string]string{"dev": "vite", "build": "vite build", "preview": "vite preview"},
+		Dependencies: map[string]string{"react": "latest", "react-dom": "latest"},
+		DevDeps:      map[string]string{"vite": "latest"},
+	}, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encode project package manifest: %w", err)
+	}
+
+	files := []struct {
+		path    string
+		content string
+	}{
+		{path: "package.json", content: string(packageJSON) + "\n"},
+		{path: "index.html", content: `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>My Portfolio</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+`},
+		{path: filepath.Join("src", "main.jsx"), content: `import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App.jsx";
+import "./index.css";
+
+createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
+`},
+		{path: filepath.Join("src", "App.jsx"), content: `const projects = [
+  { title: "Featured project", description: "A project you're proud to share." },
+  { title: "Another project", description: "A little more about what you can build." },
+];
+
+export default function App() {
+  return (
+    <main>
+      <nav><a className="brand" href="#">Portfolio</a><a href="#projects">Projects</a><a href="#contact">Contact</a></nav>
+      <section className="hero">
+        <p className="eyebrow">DESIGNER · DEVELOPER · CREATOR</p>
+        <h1>Hi, I'm <span>Your Name.</span></h1>
+        <p>I build thoughtful digital experiences that make a difference.</p>
+        <a className="button" href="#projects">Explore my work <span aria-hidden="true">→</span></a>
+      </section>
+      <section id="projects">
+        <p className="eyebrow">SELECTED WORK</p><h2>Things I've made</h2>
+        <div className="projects">{projects.map((project) => (
+          <article className="card" key={project.title}><h3>{project.title}</h3><p>{project.description}</p></article>
+        ))}</div>
+      </section>
+      <footer id="contact"><h2>Let's make something great.</h2><a href="mailto:hello@example.com">hello@example.com</a></footer>
+    </main>
+  );
+}
+`},
+		{path: filepath.Join("src", "index.css"), content: `:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #17211c; background: #f7f8f4; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1080px; margin: auto; padding: 0 32px; }
+nav { height: 88px; display: flex; align-items: center; gap: 30px; }
+nav a, footer a { color: inherit; text-decoration: none; }
+.brand { margin-right: auto; font-size: 20px; font-weight: 750; }
+.hero { min-height: 540px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; }
+.eyebrow { color: #6b7b6e; font-size: 12px; font-weight: 700; letter-spacing: .14em; }
+h1 { max-width: 760px; margin: 12px 0; font-size: clamp(52px, 9vw, 94px); line-height: 1.02; letter-spacing: -.06em; }
+h1 span { color: #64866d; }
+.hero > p:not(.eyebrow) { max-width: 460px; color: #647069; font-size: 19px; line-height: 1.6; }
+.button { margin-top: 20px; padding: 14px 19px; border-radius: 6px; color: white; background: #263d30; text-decoration: none; }
+.button span { margin-left: 12px; }
+section#projects { padding: 72px 0; }
+h2 { font-size: 36px; letter-spacing: -.04em; }
+.projects { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+.card { min-height: 180px; padding: 24px; border: 1px solid #e4e9e2; border-radius: 10px; background: white; }
+.card p { color: #647069; line-height: 1.6; }
+footer { margin-top: 56px; padding: 50px 0; border-top: 1px solid #e4e9e2; }
+@media (max-width: 600px) { main { padding: 0 20px; } nav { gap: 16px; } .hero { min-height: 440px; } }
+`},
+	}
+	for _, file := range files {
+		if _, err := e.create(filepath.Join(name, file.path), file.content); err != nil {
+			return "", fmt.Errorf("project folder created but scaffold failed: %w", err)
+		}
+	}
+	return "Created React project " + name + ". Run npm install and npm run dev in the project directory.", nil
+}
+
+func normalizeReactProjectName(name string) (string, error) {
+	name = strings.ToLower(strings.Join(strings.Fields(name), "-"))
+	if name == "" || strings.ContainsAny(name, `/\<>:"|?*`) {
+		return "", errors.New("project name must be a single folder name")
+	}
+	for index, char := range name {
+		valid := char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '.' || char == '_' || char == '-'
+		if !valid || (index == 0 && !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9')) {
+			return "", errors.New("project name must use letters, numbers, dots, underscores, or hyphens")
+		}
+	}
+	if len(name) > 214 {
+		return "", errors.New("project name must be 214 characters or fewer")
+	}
+	switch strings.SplitN(name, ".", 2)[0] {
+	case "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+		"lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9":
+		return "", errors.New("project name is reserved on Windows")
+	}
+	return name, nil
 }
 
 func normalizeHindiCommand(input string) string {

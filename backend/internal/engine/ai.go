@@ -1,0 +1,328 @@
+package engine
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"jarvis/internal/config"
+)
+
+const (
+	maxAIToolRounds = 5
+	maxAIHistory    = 12
+	maxAIToolOutput = 16 * 1024
+	maxAIResponse   = 1024 * 1024
+)
+
+type aiAssistant struct {
+	client    *http.Client
+	endpoint  string
+	apiKey    string
+	model     string
+	configErr error
+	history   [][]chatMessage
+}
+
+type chatMessage struct {
+	Role       string         `json:"role"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type chatToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function chatFunctionCall `json:"function"`
+}
+
+type chatFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type chatCompletionRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Tools    []chatTool    `json:"tools"`
+}
+
+type chatTool struct {
+	Type     string           `json:"type"`
+	Function chatToolFunction `json:"function"`
+}
+
+type chatToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type chatCompletionResponse struct {
+	Choices []struct {
+		Message chatMessage `json:"message"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func newAIAssistant(cfg *config.Config) *aiAssistant {
+	provider := strings.ToLower(strings.TrimSpace(cfg.AIProvider))
+	if provider == "" {
+		provider = "ollama"
+	}
+
+	baseURL := strings.TrimSpace(cfg.AIBaseURL)
+	model := strings.TrimSpace(cfg.AIModel)
+	apiKey := ""
+	switch provider {
+	case "ollama":
+		if baseURL == "" {
+			baseURL = "http://127.0.0.1:11434/v1"
+		}
+		if model == "" {
+			model = "qwen2.5:3b"
+		}
+	case "openai":
+		if baseURL == "" {
+			baseURL = "https://api.openai.com/v1"
+		}
+		if model == "" {
+			model = "gpt-4o-mini"
+		}
+		apiKey = strings.TrimSpace(cfg.OpenAIKey)
+	default:
+		return &aiAssistant{configErr: fmt.Errorf("unsupported JARVIS_AI_PROVIDER %q; use ollama or openai", provider)}
+	}
+
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return &aiAssistant{configErr: errors.New("JARVIS_AI_BASE_URL must be an absolute HTTP or HTTPS URL")}
+	}
+	if provider == "openai" && apiKey == "" {
+		return &aiAssistant{configErr: errors.New("OPENAI_API_KEY is required when JARVIS_AI_PROVIDER=openai")}
+	}
+	return &aiAssistant{
+		client:   &http.Client{Timeout: 75 * time.Second},
+		endpoint: strings.TrimRight(baseURL, "/") + "/chat/completions",
+		apiKey:   apiKey,
+		model:    model,
+	}
+}
+
+func (a *aiAssistant) respond(input string, execute func(string, json.RawMessage) (string, error)) (string, error) {
+	if a.configErr != nil {
+		return "", a.configErr
+	}
+
+	turn := []chatMessage{{Role: "user", Content: input}}
+	for round := 0; round < maxAIToolRounds; round++ {
+		messages := []chatMessage{{Role: "system", Content: aiSystemPrompt}}
+		for _, previousTurn := range a.history {
+			messages = append(messages, previousTurn...)
+		}
+		messages = append(messages, turn...)
+
+		response, err := a.complete(messages)
+		if err != nil {
+			return "", err
+		}
+		if len(response.ToolCalls) == 0 {
+			reply := strings.TrimSpace(response.Content)
+			if reply == "" {
+				return "", errors.New("AI provider returned an empty response")
+			}
+			turn = append(turn, chatMessage{Role: "assistant", Content: reply})
+			a.history = append(a.history, turn)
+			if len(a.history) > maxAIHistory {
+				a.history = a.history[len(a.history)-maxAIHistory:]
+			}
+			return reply, nil
+		}
+		if len(response.ToolCalls) > 8 {
+			return "", errors.New("AI provider requested too many tools in one response")
+		}
+
+		turn = append(turn, chatMessage{Role: "assistant", Content: response.Content, ToolCalls: response.ToolCalls})
+		for _, call := range response.ToolCalls {
+			if call.ID == "" || call.Type != "function" {
+				return "", errors.New("AI provider returned an invalid tool call")
+			}
+			output, toolErr := execute(call.Function.Name, json.RawMessage(call.Function.Arguments))
+			if toolErr != nil {
+				output = "Error: " + toolErr.Error()
+			}
+			output = limitAIToolOutput(output)
+			turn = append(turn, chatMessage{
+				Role:       "tool",
+				Content:    output,
+				ToolCallID: call.ID,
+			})
+		}
+	}
+	return "", errors.New("AI provider exceeded the tool-call limit")
+}
+
+func limitAIToolOutput(output string) string {
+	if len(output) <= maxAIToolOutput {
+		return output
+	}
+	truncated := output[:maxAIToolOutput]
+	for !utf8.ValidString(truncated) && len(truncated) > 0 {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated + "\n[Output truncated]"
+}
+
+func (a *aiAssistant) complete(messages []chatMessage) (chatMessage, error) {
+	body, err := json.Marshal(chatCompletionRequest{
+		Model:    a.model,
+		Messages: messages,
+		Tools:    aiTools,
+	})
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("encode AI request: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("create AI request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if a.apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("contact AI provider: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxAIResponse+1))
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("read AI response: %w", err)
+	}
+	if len(responseBody) > maxAIResponse {
+		return chatMessage{}, errors.New("AI provider response exceeded 1 MiB")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var failure chatCompletionResponse
+		if json.Unmarshal(responseBody, &failure) == nil && failure.Error != nil && failure.Error.Message != "" {
+			return chatMessage{}, fmt.Errorf("AI provider returned HTTP %d: %s", response.StatusCode, failure.Error.Message)
+		}
+		return chatMessage{}, fmt.Errorf("AI provider returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	var result chatCompletionResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return chatMessage{}, fmt.Errorf("decode AI response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return chatMessage{}, errors.New("AI provider returned no choices")
+	}
+	return result.Choices[0].Message, nil
+}
+
+func decodeToolArguments(arguments json.RawMessage, target any) error {
+	if len(arguments) == 0 || string(arguments) == "null" {
+		return errors.New("tool arguments must be a JSON object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(arguments))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid tool arguments: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("tool arguments must contain exactly one JSON object")
+	}
+	return nil
+}
+
+const aiSystemPrompt = `You are JARVIS, a helpful desktop assistant. Understand natural-language requests and reply conversationally. For a request requiring computer actions, use only the provided tools and only within the configured workspace. Never invent tool results or claim an action succeeded unless a tool confirms it. For multi-step requests, perform the necessary steps in order, then summarize what happened. Ask a concise clarifying question instead of guessing when an action is ambiguous. Never execute shell commands or claim you did.`
+
+var aiTools = []chatTool{
+	{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "open_app",
+			Description: "Open one of the installed, supported applications. For VS Code, optionally open a workspace-relative directory.",
+			Parameters: objectSchema(map[string]any{
+				"app":       map[string]any{"type": "string", "enum": []string{"chrome", "vscode", "notepad"}},
+				"directory": map[string]any{"type": "string", "description": "Optional existing workspace-relative directory; only valid for vscode"},
+			}, "app"),
+		},
+	},
+	{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "create_react_project",
+			Description: "Create a ready-to-install Vite and React portfolio starter in a new folder inside the workspace.",
+			Parameters: objectSchema(map[string]any{
+				"project_name": map[string]any{"type": "string", "description": "Single folder name for the new project"},
+			}, "project_name"),
+		},
+	},
+	{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "create_file",
+			Description: "Create a new file in the JARVIS workspace. The parent directory must already exist.",
+			Parameters: objectSchema(map[string]any{
+				"file": map[string]any{"type": "string", "description": "Workspace-relative file path"},
+				"text": map[string]any{"type": "string", "description": "Complete file contents"},
+			}, "file", "text"),
+		},
+	},
+	{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "read_file",
+			Description: "Read a regular file from the JARVIS workspace.",
+			Parameters: objectSchema(map[string]any{
+				"file": map[string]any{"type": "string", "description": "Workspace-relative file path"},
+			}, "file"),
+		},
+	},
+	{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "append_file",
+			Description: "Append text to a regular file in the JARVIS workspace.",
+			Parameters: objectSchema(map[string]any{
+				"file": map[string]any{"type": "string", "description": "Workspace-relative file path"},
+				"text": map[string]any{"type": "string", "description": "Text to append"},
+			}, "file", "text"),
+		},
+	},
+	{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "system_info",
+			Description: "Get CPU, memory, and battery information for this computer.",
+			Parameters:  objectSchema(map[string]any{}),
+		},
+	},
+}
+
+func objectSchema(properties map[string]any, required ...string) map[string]any {
+	if required == nil {
+		required = []string{}
+	}
+	return map[string]any{
+		"type":                 "object",
+		"properties":           properties,
+		"required":             required,
+		"additionalProperties": false,
+	}
+}

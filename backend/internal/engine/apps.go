@@ -9,7 +9,7 @@ import (
 	"runtime"
 )
 
-func startApplication(name string) error {
+func startApplication(name string, args ...string) error {
 	var candidates []string
 	switch name {
 	case "chrome":
@@ -42,7 +42,7 @@ func startApplication(name string) error {
 		if err != nil {
 			continue
 		}
-		cmd := exec.Command(path)
+		cmd := exec.Command(path, args...)
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start application: %w", err)
 		}

@@ -79,7 +79,7 @@ func TestFileCommandsRejectSymlinkEscape(t *testing.T) {
 func TestCommandsAndAppAllowlist(t *testing.T) {
 	assistant, _ := newTestEngine(t)
 	launched := ""
-	assistant.launch = func(name string) error {
+	assistant.launch = func(name string, _ ...string) error {
 		launched = name
 		return nil
 	}
@@ -116,7 +116,7 @@ func TestSystemCommand(t *testing.T) {
 
 func TestHindiCommands(t *testing.T) {
 	assistant, root := newTestEngine(t)
-	assistant.launch = func(name string) error {
+	assistant.launch = func(name string, _ ...string) error {
 		if name != "chrome" {
 			t.Fatalf("launch called for %q", name)
 		}

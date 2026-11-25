@@ -73,15 +73,11 @@ function startAssistant() {
   return child;
 }
 
-function executeCommand(command) {
-  if (typeof command !== "string" || command.trim() === "" || command.length > 4096) {
-    return Promise.reject(new Error("Enter a command up to 4096 characters long."));
-  }
-
+function sendAssistantRequest(request) {
   const child = startAssistant();
   return new Promise((resolve, reject) => {
     pendingRequests.push({ resolve, reject });
-    child.stdin.write(`${JSON.stringify({ command })}\n`, (error) => {
+    child.stdin.write(`${JSON.stringify(request)}\n`, (error) => {
       if (!error) {
         return;
       }
@@ -94,6 +90,13 @@ function executeCommand(command) {
   });
 }
 
+function executeCommand(command) {
+  if (typeof command !== "string" || command.trim() === "" || command.length > 4096) {
+    return Promise.reject(new Error("Enter a command up to 4096 characters long."));
+  }
+  return sendAssistantRequest({ command });
+}
+
 function isTrustedWindow(event) {
   return mainWindow && event.sender === mainWindow.webContents;
 }
@@ -104,6 +107,12 @@ function registerIPC() {
       throw new Error("Untrusted command request.");
     }
     return executeCommand(command);
+  });
+  ipcMain.handle("jarvis:clear-conversation", (event) => {
+    if (!isTrustedWindow(event)) {
+      throw new Error("Untrusted conversation request.");
+    }
+    return sendAssistantRequest({ clearConversation: true });
   });
   ipcMain.handle("jarvis:workspace", (event) => {
     if (!isTrustedWindow(event)) {

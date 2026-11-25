@@ -31,3 +31,29 @@ is open. Hindi commands include `क्रोम खोलो`, `नोटपै
 
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.
+
+## AI conversation
+
+Natural-language requests and follow-up questions use Ollama by default. Install
+Ollama, download a tool-capable model such as `qwen2.5:3b`, and start the Ollama
+service. JARVIS connects to its OpenAI-compatible API at
+`http://127.0.0.1:11434/v1`.
+
+To use OpenAI instead, set these variables before starting the desktop app (or
+put them in a `.env` file in the repository root or `backend` directory):
+
+```text
+JARVIS_AI_PROVIDER=openai
+OPENAI_API_KEY=your-api-key
+JARVIS_AI_MODEL=gpt-4o-mini
+```
+
+Optional settings are `JARVIS_AI_PROVIDER=ollama|openai`,
+`JARVIS_AI_BASE_URL`, and `JARVIS_AI_MODEL`. Keep API keys out of source control.
+Conversation context stays in memory for the lifetime of the app; **Clear**
+removes both the visible transcript and that context. AI actions are limited to
+opening Chrome, VS Code, or Notepad; reading, creating, and appending files
+inside the selected workspace; and system information. AI cannot run shell
+commands or delete files. A React portfolio starter can be scaffolded inside
+the workspace and opened directly in VS Code; run `npm install` in that folder
+before starting its Vite development server.

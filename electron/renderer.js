@@ -314,12 +314,17 @@ document.querySelectorAll("[data-command]").forEach((button) => {
   });
 });
 
-document.querySelector("#clear-button").addEventListener("click", () => {
-  conversation.replaceChildren();
-  const emptyState = document.createElement("p");
-  emptyState.className = "empty-state";
-  emptyState.textContent = "Your recent commands and JARVIS responses will appear here.";
-  conversation.append(emptyState);
+document.querySelector("#clear-button").addEventListener("click", async () => {
+  try {
+    await window.jarvis.clearConversation();
+    conversation.replaceChildren();
+    const emptyState = document.createElement("p");
+    emptyState.className = "empty-state";
+    emptyState.textContent = "Your recent commands and JARVIS responses will appear here.";
+    conversation.append(emptyState);
+  } catch (error) {
+    setStatus(`Could not clear conversation: ${error.message}`);
+  }
 });
 
 document.querySelector("#workspace-button").addEventListener("click", async () => {
