@@ -1,23 +1,65 @@
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const voiceCore = window.JarvisVoiceCore;
 const microphoneButton = document.querySelector("#microphone-button");
 const microphoneLabel = document.querySelector("#microphone-label");
+const muteButton = document.querySelector("#mute-button");
 const languagePicker = document.querySelector("#language");
 const statusText = document.querySelector("#status");
+const voiceDetail = document.querySelector("#voice-detail");
 const conversation = document.querySelector("#conversation");
 const commandForm = document.querySelector("#command-form");
 const commandInput = document.querySelector("#command-input");
 const workspacePath = document.querySelector("#workspace-path");
 const microphonePrivacy = document.querySelector("#microphone-privacy");
+const microphoneIndicator = document.querySelector("#microphone-indicator");
 const integrationsList = document.querySelector("#integrations-list");
+const backgroundTasks = document.querySelector("#background-tasks");
 
-let recognition;
+let voiceSettings;
+let voiceState = "Offline";
 let listening = false;
-let awaitingCommandUntil = 0;
+let muted = false;
+let activeConversation = false;
+let conversationTimer;
+let mediaStream;
+let audioContext;
+let audioNode;
+let audioSource;
+let segmenter;
 let processing = false;
-let restartTimer;
+let transcriptionQueue = Promise.resolve();
+let commandQueue = Promise.resolve();
+let currentSpokenText = "";
+let spokenEchoWindowUntil = 0;
+let knownTaskStates = new Map();
+let taskPollTimer;
+let taskBaselineLoaded = false;
+let taskPollPending = false;
+const rendererStartedAt = Date.now();
+const announcedTaskIds = new Set();
+let captureGeneration = 0;
+let captureStartPromise;
 
 function setStatus(message) {
-  statusText.textContent = message;
+  voiceDetail.textContent = message;
+}
+
+function setVoiceState(state, detail = "") {
+  voiceState = state;
+  statusText.textContent = state;
+  voiceDetail.textContent = detail;
+  document.body.dataset.voiceState = state.toLowerCase().replaceAll(" ", "-");
+  document.body.classList.toggle("is-listening", listening);
+  microphoneIndicator.textContent = muted
+    ? "Microphone is muted"
+    : listening
+      ? "Microphone is on; audio is processed locally"
+      : "Microphone is off";
+  microphonePrivacy.textContent = muted
+    ? "Microphone is muted."
+    : listening
+      ? "Local wake-word and speech recognition are active; no recordings are retained."
+      : "Listening is paused; the microphone is off.";
+  window.jarvis.setVoiceState(state, detail);
 }
 
 function addMessage(role, text) {
@@ -29,72 +71,144 @@ function addMessage(role, text) {
   conversation.scrollTop = conversation.scrollHeight;
 }
 
-function speak(text) {
-  if (!text || !("speechSynthesis" in window)) {
+async function speak(text) {
+  if (!text) {
     return;
   }
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = languagePicker.value;
-  utterance.rate = 0.96;
-  utterance.pitch = 0.92;
-  const language = languagePicker.value.split("-")[0].toLowerCase();
-  const voice = window.speechSynthesis.getVoices().find((candidate) =>
-    candidate.lang.toLowerCase().startsWith(language),
-  );
-  if (voice) {
-    utterance.voice = voice;
-  }
-  window.speechSynthesis.speak(utterance);
-}
-
-function setListening(value) {
-  listening = value;
-  document.body.classList.toggle("is-listening", value);
-  microphoneLabel.textContent = value ? "Stop listening" : "Start listening";
-  microphonePrivacy.textContent = value
-    ? "Microphone is on while listening is enabled"
-    : "Microphone is off until you start listening";
-  if (!value) {
-    document.body.classList.remove("is-awake");
-    awaitingCommandUntil = 0;
-    window.clearTimeout(restartTimer);
-  }
-}
-
-function stopListening(message, announce = true) {
-  setListening(false);
-  if (recognition) {
-    recognition.stop();
-  }
-  setStatus("Microphone paused");
-  if (message) {
-    addMessage("assistant", message);
-    if (announce) {
-      speak(message);
-    }
-  }
-}
-
-function startListening() {
-  if (!recognition) {
-    setStatus("Speech recognition is not available in this runtime.");
-    addMessage("assistant", "Speech recognition is unavailable. Try a supported speech runtime or type a command.");
-    return;
-  }
-
-  recognition.lang = languagePicker.value;
+  currentSpokenText = text;
+  spokenEchoWindowUntil = Number.POSITIVE_INFINITY;
+  setVoiceState("Speaking");
   try {
-    recognition.start();
-    setListening(true);
-    setStatus("Listening for Hey Jarvis");
-  } catch (error) {
-    setStatus(`Could not start the microphone: ${error.message}`);
+    await window.jarvis.speak(text);
+  } finally {
+    spokenEchoWindowUntil = Date.now() + 5000;
   }
 }
 
-function normalizeText(text) {
-  return text.toLocaleLowerCase().replace(/[.,!?،؛؟]/g, " ").replace(/\s+/g, " ").trim();
+function updateMicrophoneButtons() {
+  microphoneLabel.textContent = voiceSettings?.listeningEnabled ? "Pause listening" : "Resume listening";
+  muteButton.textContent = muted ? "Unmute microphone" : "Mute microphone";
+  microphoneButton.disabled = false;
+}
+
+function transcriptionLanguage() {
+  if (languagePicker.value === "en-US") {
+    return "en";
+  }
+  if (languagePicker.value === "hi-IN") {
+    return "hi";
+  }
+  return "auto";
+}
+
+async function stopCapture(nextState = "Sleep", detail = "") {
+  captureGeneration += 1;
+  listening = false;
+  activeConversation = false;
+  window.clearTimeout(conversationTimer);
+  if (audioNode) {
+    audioNode.port.onmessage = null;
+    audioNode.disconnect();
+    audioNode = undefined;
+  }
+  if (audioSource) {
+    audioSource.disconnect();
+    audioSource = undefined;
+  }
+  if (mediaStream) {
+    for (const track of mediaStream.getTracks()) {
+      track.stop();
+    }
+    mediaStream = undefined;
+  }
+  if (audioContext) {
+    const context = audioContext;
+    audioContext = undefined;
+    await context.close();
+  }
+  document.body.classList.remove("is-listening", "is-awake");
+  updateMicrophoneButtons();
+  setVoiceState(nextState, detail);
+}
+
+async function startCapture() {
+  if (listening) {
+    return;
+  }
+  if (captureStartPromise) {
+    return captureStartPromise;
+  }
+  if (muted || !voiceSettings?.listeningEnabled) {
+    await stopCapture("Sleep", muted ? "Microphone is muted." : "Listening is paused.");
+    return;
+  }
+  if (!voiceSettings?.runtime?.available) {
+    await stopCapture("Offline", voiceSettings?.runtime?.message || "Configure offline voice recognition.");
+    return;
+  }
+  const generation = ++captureGeneration;
+  captureStartPromise = (async () => {
+    let failed = false;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+        return;
+      }
+      mediaStream = stream;
+      audioContext = new AudioContext({ sampleRate: voiceCore.TARGET_SAMPLE_RATE });
+      await audioContext.audioWorklet.addModule("voice-capture-worklet.js");
+      if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
+        await stopCapture("Sleep", muted ? "Microphone is muted." : "Listening is paused.");
+        return;
+      }
+      audioSource = audioContext.createMediaStreamSource(mediaStream);
+      audioNode = new AudioWorkletNode(audioContext, "jarvis-capture", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      const mutedOutput = audioContext.createGain();
+      mutedOutput.gain.value = 0;
+      segmenter = new voiceCore.VoiceActivitySegmenter({ sampleRate: audioContext.sampleRate });
+      audioNode.port.onmessage = ({ data }) => {
+        const input = data instanceof Float32Array ? data : new Float32Array(data);
+        const samples = voiceCore.resampleTo16k(input, audioContext.sampleRate);
+        const utterance = segmenter.push(samples);
+        if (utterance) {
+          queueTranscription(utterance);
+        }
+      };
+      audioSource.connect(audioNode);
+      audioNode.connect(mutedOutput);
+      mutedOutput.connect(audioContext.destination);
+      if (generation !== captureGeneration) {
+        await stopCapture("Sleep", "Listening is paused.");
+        return;
+      }
+      listening = true;
+      updateMicrophoneButtons();
+      setVoiceState(activeConversation ? "Listening" : "Standby");
+    } catch (error) {
+      failed = true;
+      await stopCapture("Error", `Could not start the microphone: ${error.message}`);
+    } finally {
+      captureStartPromise = undefined;
+      if (!failed && !listening && voiceSettings?.listeningEnabled && !muted && generation !== captureGeneration) {
+        void startCapture();
+      }
+    }
+  })();
+  return captureStartPromise;
 }
 
 function spokenReply(command, reply) {
@@ -128,33 +242,89 @@ function spokenReply(command, reply) {
   return reply;
 }
 
-function isStopCommand(text) {
-  const normalized = normalizeText(text);
+function refreshConversationSession() {
+  activeConversation = true;
+  document.body.classList.add("is-awake");
+  window.clearTimeout(conversationTimer);
+  conversationTimer = window.setTimeout(() => {
+    activeConversation = false;
+    document.body.classList.remove("is-awake");
+    if (listening && voiceState !== "Speaking" && !processing) {
+      setVoiceState("Standby");
+    }
+  }, 45000);
+}
+
+function isPausePhrase(text) {
+  const normalized = voiceCore.normalizeSpeechText(text);
   return [
-    "stop listening",
-    "pause listening",
-    "go to sleep",
-    "सुनना बंद करो",
-    "सुनना बंद कर",
-    "चुप हो जाओ",
-    "रुक जाओ",
+    "stop listening", "pause listening", "go to sleep",
+    "सुनना बंद करो", "सुनना बंद कर", "चुप हो जाओ",
   ].some((phrase) => normalized.includes(phrase));
 }
 
-function removeWakeWord(text) {
-  const candidates = [
-    /hey\s+jarvis/i,
-    /jarvis/i,
-    /हे\s*जार्विस/i,
-    /जार्विस/i,
-  ];
-  for (const pattern of candidates) {
-    const match = pattern.exec(text);
-    if (match) {
-      return text.slice(0, match.index) + text.slice(match.index + match[0].length);
+function queueTranscription(samples) {
+  transcriptionQueue = transcriptionQueue.then(async () => {
+    if (!listening) {
+      return;
     }
+    if (voiceState !== "Speaking") {
+      setVoiceState("Thinking", "Checking speech locally.");
+    }
+    try {
+      const wav = voiceCore.encodeWav(
+        voiceCore.resampleTo16k(samples, voiceCore.TARGET_SAMPLE_RATE),
+        voiceCore.TARGET_SAMPLE_RATE,
+      );
+      const transcript = await window.jarvis.transcribeAudio(wav, transcriptionLanguage());
+      if (transcript) {
+        await handleTranscript(transcript);
+      }
+    } catch (error) {
+      setVoiceState("Error", error.message);
+    } finally {
+      if (listening && voiceState !== "Speaking" && !processing) {
+        setVoiceState(activeConversation ? "Listening" : "Standby");
+      }
+    }
+  }).catch((error) => {
+    setVoiceState("Error", `Offline transcription queue failed: ${error.message}`);
+  });
+}
+
+function enqueueCommand(command, spoken = true) {
+  commandQueue = commandQueue.then(() => executeCommand(command, spoken));
+  return commandQueue;
+}
+
+async function handleTranscript(transcript) {
+  if (!listening || !transcript.trim()) {
+    return;
   }
-  return null;
+  const mayBeEcho = voiceState === "Speaking" || Date.now() < spokenEchoWindowUntil;
+  if (mayBeEcho && voiceCore.resemblesEcho(transcript, currentSpokenText)) {
+    return;
+  }
+  if (voiceState === "Speaking") {
+    await window.jarvis.interruptSpeech();
+    currentSpokenText = "";
+    spokenEchoWindowUntil = 0;
+  }
+  const wake = voiceCore.extractWakeCommand(transcript);
+  if (!activeConversation && !wake.activated) {
+    return;
+  }
+  const command = wake.activated ? wake.command : transcript.trim();
+  if (isPausePhrase(command || transcript)) {
+    await window.jarvis.setVoiceControl("pause");
+    return;
+  }
+  refreshConversationSession();
+  if (!command) {
+    await speak(languagePicker.value === "hi-IN" ? "जी, बताइए।" : "Yes, I'm listening.");
+    return;
+  }
+  await enqueueCommand(command);
 }
 
 function addIntegrationButton(container, action, account) {
@@ -245,6 +415,84 @@ async function loadIntegrations() {
   }
 }
 
+function renderTasks(tasks) {
+  backgroundTasks.replaceChildren();
+  if (!tasks.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "No background tasks yet.";
+    backgroundTasks.append(empty);
+    return;
+  }
+  for (const task of tasks) {
+    const row = document.createElement("article");
+    row.className = "background-task";
+    const details = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = task.description;
+    const status = document.createElement("p");
+    status.textContent = `${task.status}${task.output ? ` — ${task.output}` : ""}${task.error ? ` — ${task.error}` : ""}`;
+    details.append(title, status);
+    row.append(details);
+    if (task.status === "queued" || task.status === "running") {
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Cancel";
+      cancel.dataset.cancelTask = task.id;
+      row.append(cancel);
+    }
+    backgroundTasks.append(row);
+  }
+}
+
+async function pollBackgroundTasks() {
+  if (taskPollPending) {
+    return;
+  }
+  taskPollPending = true;
+  try {
+    const response = await window.jarvis.getTasks();
+    const tasks = Array.isArray(response.data) ? response.data : [];
+    renderTasks(tasks);
+    for (const task of tasks) {
+      const previousStatus = knownTaskStates.get(task.id);
+      const createdDuringSession = Date.parse(task.createdAt) >= rendererStartedAt;
+      const changedSinceObserved = taskBaselineLoaded && previousStatus && previousStatus !== task.status;
+      if (task.status === "completed" && task.output && !announcedTaskIds.has(task.id) &&
+          (changedSinceObserved || (!previousStatus && createdDuringSession))) {
+        announcedTaskIds.add(task.id);
+        addMessage("assistant", task.output);
+        try {
+          await speak(task.output);
+        } catch (error) {
+          setVoiceState("Error", `Task notification speech failed: ${error.message}`);
+        }
+      } else if ((task.status === "failed" || task.status === "timed_out") &&
+          !announcedTaskIds.has(task.id) &&
+          (changedSinceObserved || (!previousStatus && createdDuringSession))) {
+        announcedTaskIds.add(task.id);
+        addMessage("assistant", `${task.description}: ${task.error}`);
+      }
+      knownTaskStates.set(task.id, task.status);
+    }
+    taskBaselineLoaded = true;
+    const active = tasks.some((task) => task.status === "queued" || task.status === "running");
+    if (active && !processing && voiceState !== "Speaking" && voiceState !== "Error") {
+      setVoiceState("Working in background", "JARVIS is running a background task.");
+    } else if (!active && voiceState === "Working in background") {
+      setVoiceState(listening ? (activeConversation ? "Listening" : "Standby") : "Sleep");
+    }
+  } catch (error) {
+    backgroundTasks.replaceChildren();
+    const message = document.createElement("p");
+    message.className = "empty-state";
+    message.textContent = `Could not load background tasks: ${error.message}`;
+    backgroundTasks.append(message);
+  } finally {
+    taskPollPending = false;
+  }
+}
+
 async function runIntegrationAction(action, account) {
   let command;
   if (action === "connect") {
@@ -262,14 +510,11 @@ async function runIntegrationAction(action, account) {
   } else {
     return;
   }
-  await executeCommand(command, false);
+  await enqueueCommand(command, false);
   await loadIntegrations();
 }
 
 async function executeCommand(command, spoken = true) {
-  if (processing) {
-    return;
-  }
   const trimmed = command.trim();
   if (!trimmed) {
     return;
@@ -278,149 +523,83 @@ async function executeCommand(command, spoken = true) {
   processing = true;
   document.body.classList.remove("is-awake");
   addMessage("user", trimmed);
-  setStatus("Working on it…");
+  setVoiceState("Thinking", "Working on your request.");
   try {
     const result = await window.jarvis.executeCommand(trimmed);
     const reply = result.output || "Done.";
     addMessage("assistant", reply);
-    setStatus(listening ? "Listening for Hey Jarvis" : "Ready");
     if (spoken) {
-      speak(spokenReply(trimmed, reply));
+      try {
+        await speak(spokenReply(trimmed, reply));
+      } catch (error) {
+        setVoiceState("Error", `Speech output failed: ${error.message}`);
+      }
     }
   } catch (error) {
     addMessage("assistant", error.message);
-    setStatus("I couldn't complete that command.");
+    setVoiceState("Error", "I couldn't complete that command.");
     if (spoken) {
-      speak(languagePicker.value === "hi-IN"
-        ? `कमांड पूरा नहीं हो सका। ${error.message}`
-        : error.message);
+      try {
+        await speak(languagePicker.value === "hi-IN"
+          ? `कमांड पूरा नहीं हो सका। ${error.message}`
+          : error.message);
+      } catch (speechError) {
+        setVoiceState("Error", `Speech output failed: ${speechError.message}`);
+      }
     }
   } finally {
     processing = false;
-  }
-}
-
-async function handleTranscript(transcript) {
-  if (!listening || processing) {
-    return;
-  }
-  if (isStopCommand(transcript)) {
-    stopListening("Listening stopped. Click the microphone when you want me again.");
-    return;
-  }
-
-  if (Date.now() < awaitingCommandUntil) {
-    awaitingCommandUntil = 0;
-    await executeCommand(transcript);
-    return;
-  }
-
-  const command = removeWakeWord(transcript);
-  if (command === null) {
-    return;
-  }
-  const cleanedCommand = command.replace(/^[\s,.:;!?-]+/, "").trim();
-  document.body.classList.add("is-awake");
-  if (cleanedCommand) {
-    await executeCommand(cleanedCommand);
-  } else {
-    awaitingCommandUntil = Date.now() + 8000;
-    setStatus("I'm listening…");
-    speak(languagePicker.value === "hi-IN" ? "जी, बताइए।" : "I'm listening.");
-    window.setTimeout(() => {
-      if (Date.now() >= awaitingCommandUntil) {
-        awaitingCommandUntil = 0;
-        document.body.classList.remove("is-awake");
-        if (listening) {
-          setStatus("Listening for Hey Jarvis");
-        }
-      }
-    }, 8100);
-  }
-}
-
-function setupRecognition() {
-  if (!SpeechRecognition) {
-    setStatus("Speech recognition is unavailable; typed commands still work.");
-    return;
-  }
-  recognition = new SpeechRecognition();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.maxAlternatives = 1;
-  recognition.lang = languagePicker.value;
-
-  recognition.onresult = (event) => {
-    let transcript = "";
-    for (let index = event.resultIndex; index < event.results.length; index += 1) {
-      const result = event.results[index];
-      if (result.isFinal) {
-        transcript += `${result[0].transcript} `;
-      }
+    if (listening && voiceState !== "Speaking" && voiceState !== "Error") {
+      setVoiceState(activeConversation ? "Listening" : "Standby");
     }
-    if (transcript.trim()) {
-      void handleTranscript(transcript.trim());
-    }
-  };
-  recognition.onerror = (event) => {
-    if (event.error === "no-speech" || event.error === "aborted") {
-      return;
-    }
-    const message = event.error === "not-allowed" || event.error === "service-not-allowed"
-      ? "Microphone permission was denied."
-      : event.error === "network"
-        ? "Speech service is unavailable. Check your internet connection."
-        : `Speech recognition error: ${event.error}`;
-    setStatus(message);
-    if (event.error === "not-allowed" || event.error === "service-not-allowed" || event.error === "network") {
-      setListening(false);
-    }
-  };
-  recognition.onend = () => {
-    if (listening) {
-      restartTimer = window.setTimeout(() => {
-        if (listening) {
-          try {
-            recognition.start();
-          } catch {
-            setStatus("Reconnecting to speech recognition…");
-          }
-        }
-      }, 350);
-    }
-  };
+  }
 }
 
 microphoneButton.addEventListener("click", () => {
-  if (listening) {
-    stopListening();
-  } else {
-    startListening();
-  }
+  void window.jarvis.setVoiceControl(voiceSettings?.listeningEnabled ? "pause" : "resume")
+    .catch((error) => setVoiceState("Error", error.message));
 });
 
-languagePicker.addEventListener("change", () => {
-  const restart = listening;
-  if (restart) {
-    stopListening();
+muteButton.addEventListener("click", () => {
+  void window.jarvis.setVoiceControl(muted ? "unmute" : "mute")
+    .catch((error) => setVoiceState("Error", error.message));
+});
+
+window.jarvis.onVoiceAction((action) => {
+  if (!voiceSettings) {
+    return;
   }
-  if (recognition) {
-    recognition.lang = languagePicker.value;
+  if (action === "resume") {
+    voiceSettings.listeningEnabled = true;
+    void startCapture();
+  } else if (action === "pause") {
+    voiceSettings.listeningEnabled = false;
+    void stopCapture("Sleep", "Listening is paused.");
+  } else if (action === "mute") {
+    muted = true;
+    voiceSettings.muted = true;
+    void stopCapture("Sleep", "Microphone is muted.");
+  } else if (action === "unmute") {
+    muted = false;
+    voiceSettings.muted = false;
+    if (voiceSettings.listeningEnabled) {
+      void startCapture();
+    } else {
+      void stopCapture("Sleep", "Listening is paused.");
+    }
   }
-  if (restart) {
-    startListening();
-  }
+  updateMicrophoneButtons();
 });
 
 commandForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  void executeCommand(commandInput.value, false);
+  void enqueueCommand(commandInput.value, false);
   commandInput.value = "";
 });
 
 document.querySelectorAll("[data-command]").forEach((button) => {
   button.addEventListener("click", () => {
-    void executeCommand(button.dataset.command, false);
+    void enqueueCommand(button.dataset.command, false);
   });
 });
 
@@ -459,14 +638,46 @@ integrationsList.addEventListener("click", (event) => {
     void runIntegrationAction(button.dataset.integrationAction, button.dataset.account);
   }
 });
-
-if (SpeechRecognition) {
-  microphoneButton.disabled = false;
-}
-setupRecognition();
-window.jarvis.getWorkspace().then((workspace) => {
-  workspacePath.textContent = workspace;
-}).catch((error) => {
-  setStatus(`Could not load workspace: ${error.message}`);
+backgroundTasks.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-cancel-task]");
+  if (button) {
+    void enqueueCommand(`cancel task ${button.dataset.cancelTask}`, false);
+  }
 });
-void loadIntegrations();
+
+window.jarvis.onVoiceState((update) => {
+  if (update?.state && update.state !== voiceState) {
+    voiceState = update.state;
+    statusText.textContent = update.state;
+    if (update.detail) {
+      voiceDetail.textContent = update.detail;
+    }
+  }
+});
+
+async function initializeDesktop() {
+  try {
+    voiceSettings = await window.jarvis.getVoiceSettings();
+    muted = voiceSettings.muted;
+    updateMicrophoneButtons();
+    if (voiceSettings.listeningEnabled && !muted) {
+      await startCapture();
+    } else {
+      await stopCapture("Sleep", muted ? "Microphone is muted." : "Listening is paused.");
+    }
+  } catch (error) {
+    setVoiceState("Error", `Could not initialize voice controls: ${error.message}`);
+  }
+  window.jarvis.getWorkspace().then((workspace) => {
+    workspacePath.textContent = workspace;
+  }).catch((error) => {
+    setStatus(`Could not load workspace: ${error.message}`);
+  });
+  void loadIntegrations();
+  await pollBackgroundTasks();
+  taskPollTimer = window.setInterval(() => {
+    void pollBackgroundTasks();
+  }, 3000);
+}
+
+void initializeDesktop();

@@ -37,6 +37,9 @@ const helpText = `Commands:
   integration permission <provider> <account|*> <action> <recipient|*> <allow|confirm|deny>
   integration activity [limit] Show recent communication activity
   integration emergency-stop <on|off> Block or resume communication integrations
+  tasks                         List active and recent background tasks
+  cancel task <id>              Cancel a running background task
+  remind <duration> <message>   Schedule a reminder, e.g. remind 10m take a break
   system                        Show CPU, memory, and battery information
   help                          Show this help
   exit                          Quit the assistant
@@ -64,6 +67,7 @@ type Engine struct {
 	ai           *aiAssistant
 	permissions  *permissions.Store
 	integrations *integrations.Manager
+	tasks        *TaskManager
 	pendingMu    sync.Mutex
 	pending      map[string]pendingAction
 }
@@ -112,6 +116,7 @@ func New(workspace string) (*Engine, error) {
 		ai:           newAIAssistant(cfg),
 		permissions:  permissionStore,
 		integrations: integrationManager,
+		tasks:        NewTaskManager(),
 	}, nil
 }
 
@@ -134,6 +139,9 @@ func (e *Engine) CancelConfirmation(input string) {
 
 func (e *Engine) Close() error {
 	var closeErrors []error
+	if e.tasks != nil {
+		e.tasks.Close()
+	}
 	if e.permissions != nil {
 		if err := e.permissions.Close(); err != nil {
 			closeErrors = append(closeErrors, err)
@@ -229,6 +237,22 @@ func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 			return Result{}, errors.New("usage: integrations")
 		}
 		return e.listIntegrations()
+	case "tasks":
+		if len(fields) != 1 {
+			return Result{}, errors.New("usage: tasks")
+		}
+		return e.listTasks()
+	case "cancel":
+		if len(fields) != 3 || !strings.EqualFold(fields[1], "task") {
+			return Result{}, errors.New("usage: cancel task <id>")
+		}
+		return e.cancelTask(fields[2])
+	case "remind":
+		if len(fields) < 3 {
+			return Result{}, errors.New("usage: remind <duration> <message>")
+		}
+		output, err := e.scheduleReminder(fields[1], strings.Join(fields[2:], " "))
+		return Result{Output: output}, err
 	case "connect":
 		if len(fields) != 2 {
 			return Result{}, errors.New("usage: connect google")
@@ -637,7 +661,7 @@ func (e *Engine) runAITool(input, name string, arguments json.RawMessage) (strin
 		if args.ProjectName == nil {
 			return "", errors.New("project_name is required")
 		}
-		return e.createReactProject(*args.ProjectName)
+		return e.startReactProject(*args.ProjectName)
 	case "system_info":
 		var args struct{}
 		if err := decodeToolArguments(arguments, &args); err != nil {
@@ -651,6 +675,18 @@ func (e *Engine) runAITool(input, name string, arguments json.RawMessage) (strin
 			return "", errors.New("system monitoring is not permitted")
 		}
 		return systemSummary(platformStats()), nil
+	case "schedule_reminder":
+		var args struct {
+			Delay   *string `json:"delay"`
+			Message *string `json:"message"`
+		}
+		if err := decodeToolArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.Delay == nil || args.Message == nil {
+			return "", errors.New("delay and message are required")
+		}
+		return e.scheduleReminder(*args.Delay, *args.Message)
 	case "search_gmail", "read_gmail_message", "send_gmail", "reply_gmail", "forward_gmail",
 		"archive_gmail", "trash_gmail", "download_gmail_attachment", "list_google_calendar",
 		"create_google_event", "update_google_event", "delete_google_event":
@@ -686,30 +722,55 @@ func (e *Engine) workspaceDirectory(name string) (string, error) {
 }
 
 func (e *Engine) createReactProject(name string) (string, error) {
-	name, err := normalizeReactProjectName(name)
+	name, projectPath, err := e.prepareReactProject(name)
 	if err != nil {
 		return "", err
+	}
+	return e.createReactProjectFiles(context.Background(), name, projectPath)
+}
+
+func (e *Engine) startReactProject(name string) (string, error) {
+	name, projectPath, err := e.prepareReactProject(name)
+	if err != nil {
+		return "", err
+	}
+	task, err := e.tasks.Start("Create React project "+name, 2*time.Minute, func(ctx context.Context) (string, error) {
+		return e.createReactProjectFiles(ctx, name, projectPath)
+	})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Started React project creation for %s as background task %s. The folder is ready to open; check task status for completion.", name, task.ID), nil
+}
+
+func (e *Engine) prepareReactProject(name string) (string, string, error) {
+	name, err := normalizeReactProjectName(name)
+	if err != nil {
+		return "", "", err
 	}
 	allowed, err := e.permissionAllowed("create_file", e.root)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if !allowed {
-		return "", errors.New("creating files is not permitted in this workspace")
+		return "", "", errors.New("creating files is not permitted in this workspace")
 	}
 	relative, err := e.relativePath(name)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	projectPath := filepath.Join(e.root, relative)
 	if err := os.Mkdir(projectPath, 0755); err != nil {
-		return "", fmt.Errorf("create project directory: %w", err)
+		return "", "", fmt.Errorf("create project directory: %w", err)
 	}
 	sourcePath := filepath.Join(projectPath, "src")
 	if err := os.Mkdir(sourcePath, 0755); err != nil {
-		return "", fmt.Errorf("create project source directory: %w", err)
+		return "", "", fmt.Errorf("create project source directory: %w", err)
 	}
+	return name, projectPath, nil
+}
 
+func (e *Engine) createReactProjectFiles(ctx context.Context, name, projectPath string) (string, error) {
 	packageJSON, err := json.MarshalIndent(struct {
 		Name         string            `json:"name"`
 		Version      string            `json:"version"`
@@ -810,6 +871,9 @@ footer { margin-top: 56px; padding: 50px 0; border-top: 1px solid #e4e9e2; }
 `},
 	}
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("project scaffold stopped; partial files may remain in %s: %w", projectPath, err)
+		}
 		if _, err := e.create(filepath.Join(name, file.path), file.content); err != nil {
 			return "", fmt.Errorf("project folder created but scaffold failed: %w", err)
 		}

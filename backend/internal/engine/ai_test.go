@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNaturalLanguageUsesToolsAndRemembersConversation(t *testing.T) {
@@ -97,7 +98,7 @@ func TestAIPlansReactProjectAndOpensItInVSCode(t *testing.T) {
 			_, _ = writer.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"project-1","type":"function","function":{"name":"create_react_project","arguments":"{\"project_name\":\"portfolio\"}"}},{"id":"open-1","type":"function","function":{"name":"open_app","arguments":"{\"app\":\"vscode\",\"directory\":\"portfolio\"}"}}]}}]}`))
 			return
 		}
-		_, _ = writer.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Your React portfolio starter is ready and open in VS Code."}}]}`))
+		_, _ = writer.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"Your React portfolio starter is being created in the background and opened in VS Code."}}]}`))
 	}))
 	defer server.Close()
 	assistant.ai = &aiAssistant{client: server.Client(), endpoint: server.URL + "/chat/completions", model: "test-model"}
@@ -106,8 +107,22 @@ func TestAIPlansReactProjectAndOpensItInVSCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Output != "Your React portfolio starter is ready and open in VS Code." {
+	if result.Output != "Your React portfolio starter is being created in the background and opened in VS Code." {
 		t.Fatalf("reply = %q", result.Output)
+	}
+	taskDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(taskDeadline) {
+		tasks := assistant.tasks.List()
+		if len(tasks) > 0 && tasks[0].Status == TaskCompleted {
+			break
+		}
+		if len(tasks) > 0 && (tasks[0].Status == TaskFailed || tasks[0].Status == TaskCancelled || tasks[0].Status == TaskTimedOut) {
+			t.Fatalf("React scaffold task ended in %s: %s", tasks[0].Status, tasks[0].Error)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if tasks := assistant.tasks.List(); len(tasks) == 0 || tasks[0].Status != TaskCompleted {
+		t.Fatalf("React scaffold task did not complete: %#v", tasks)
 	}
 	for _, path := range []string{
 		filepath.Join("portfolio", "package.json"),

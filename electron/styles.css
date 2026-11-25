@@ -176,6 +176,13 @@ button {
   text-transform: uppercase;
 }
 
+.voice-detail {
+  min-height: 16px;
+  margin: 3px 0 0;
+  color: #8290a9;
+  font-size: 11px;
+}
+
 h1 {
   margin: 9px 0 5px;
   font-size: clamp(24px, 4vw, 32px);
@@ -211,6 +218,29 @@ h1 {
   font-size: 13px;
   font-weight: 700;
   transition: filter 150ms ease, transform 150ms ease;
+}
+
+.voice-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 9px;
+}
+
+.mute-button {
+  min-height: 46px;
+  margin-top: 22px;
+  padding: 0 15px;
+  border: 1px solid rgba(159, 181, 220, 0.22);
+  border-radius: 12px;
+  background: rgba(15, 23, 39, 0.85);
+  color: #c2cde0;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.mute-button:hover {
+  border-color: rgba(102, 228, 255, 0.55);
 }
 
 .microphone-button:hover:not(:disabled) {
@@ -250,6 +280,7 @@ h1 {
 }
 
 .command-panel,
+.tasks-panel,
 .integrations-panel,
 .conversation-panel {
   border: 1px solid var(--line);
@@ -259,6 +290,55 @@ h1 {
 
 .command-panel {
   padding: 16px;
+}
+
+.tasks-panel {
+  margin-top: 15px;
+  padding: 16px;
+}
+
+.background-tasks {
+  display: grid;
+  margin-top: 12px;
+  gap: 8px;
+}
+
+.background-task {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(159, 181, 220, 0.12);
+  border-radius: 9px;
+  background: rgba(5, 10, 20, 0.48);
+}
+
+.background-task strong {
+  color: #d7e3f5;
+  font-size: 12px;
+}
+
+.background-task p {
+  margin: 5px 0 0;
+  color: #8290a9;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.background-task button {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 139, 139, 0.28);
+  border-radius: 7px;
+  background: rgba(65, 27, 38, 0.45);
+  color: #ffc0c0;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.background-task button:hover {
+  border-color: rgba(255, 139, 139, 0.62);
 }
 
 .integrations-panel {

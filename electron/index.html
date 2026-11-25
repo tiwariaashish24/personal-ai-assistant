@@ -9,6 +9,7 @@
     />
     <title>JARVIS Voice Assistant</title>
     <link rel="stylesheet" href="styles.css" />
+    <script src="voice-core.js" defer></script>
     <script src="renderer.js" defer></script>
   </head>
   <body>
@@ -24,6 +25,7 @@
             <select id="language">
               <option value="en-US">English</option>
               <option value="hi-IN">हिन्दी</option>
+              <option value="en-IN">Hinglish</option>
             </select>
           </label>
           <button id="workspace-button" class="workspace-button" type="button">Workspace</button>
@@ -37,15 +39,19 @@
             <span></span>
           </div>
         </div>
-        <p id="status" class="status" role="status" aria-live="polite">Starting JARVIS…</p>
+        <p id="status" class="status" role="status" aria-live="polite">Offline</p>
+        <p id="voice-detail" class="voice-detail">Install the offline voice runtime to begin.</p>
         <h1 id="assistant-title">At your service.</h1>
-        <p class="subtitle">Say <strong>“Hey Jarvis”</strong> to give a command.</p>
+        <p class="subtitle">Say <strong>“Hey Jarvis”</strong> once, then speak naturally.</p>
 
-        <button id="microphone-button" class="microphone-button" type="button" disabled>
-          <span class="mic-icon" aria-hidden="true"></span>
-          <span id="microphone-label">Start listening</span>
-        </button>
-        <p class="hint">Listening stays on while this app is open. Say “stop listening” to pause.</p>
+        <div class="voice-controls">
+          <button id="microphone-button" class="microphone-button" type="button">
+            <span class="mic-icon" aria-hidden="true"></span>
+            <span id="microphone-label">Pause listening</span>
+          </button>
+          <button id="mute-button" class="mute-button" type="button">Mute microphone</button>
+        </div>
+        <p id="microphone-privacy" class="hint">Microphone starts only after local voice setup and permission.</p>
       </section>
 
       <section class="command-panel" aria-label="Command input">
@@ -66,8 +72,22 @@
           <span>·</span>
           <button type="button" data-command="permissions">permissions</button>
           <span>·</span>
+          <button type="button" data-command="remind 10m take a break">remind me in 10 minutes</button>
+          <span>·</span>
           <button type="button" data-command="help">help</button>
         </p>
+      </section>
+
+      <section class="tasks-panel" aria-labelledby="tasks-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="tasks-title">Background tasks</h2>
+            <p class="integrations-intro">Reminders and longer-running work continue while the dashboard is hidden.</p>
+          </div>
+        </div>
+        <div id="background-tasks" class="background-tasks" aria-live="polite">
+          <p class="empty-state">No background tasks yet.</p>
+        </div>
       </section>
 
       <section class="integrations-panel" aria-labelledby="integrations-title">
@@ -94,7 +114,7 @@
       </section>
 
       <footer>
-        <span class="privacy-indicator"><i></i> <span id="microphone-privacy">Microphone is off until you start listening</span></span>
+        <span class="privacy-indicator"><i></i> <span id="microphone-indicator">Microphone is off</span></span>
         <span id="workspace-path" class="workspace-path"></span>
       </footer>
     </main>

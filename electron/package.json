@@ -5,7 +5,8 @@
   "description": "JARVIS desktop voice assistant",
   "main": "main.cjs",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node --test voice-core.test.cjs voice-runtime.test.cjs"
   },
   "devDependencies": {
     "electron": "^45.4.1"

@@ -13,21 +13,45 @@ npm start
 The app starts the Go assistant as a private JSON-lines child process. It does
 not expose a network listener. File commands use the `JARVIS` folder in your
 Documents directory by default; use **Workspace** to choose another folder.
+Closing the dashboard hides it to the system tray; choose **Exit JARVIS** from
+the tray menu to stop the assistant. The tray also controls microphone mute,
+listening pause, and login startup. JARVIS is configured to start at Windows
+login by default.
 
 ## Voice
 
-Choose English or Hindi, grant microphone permission, and select **Start
-listening**. Say **“Hey Jarvis”** followed by a supported command, or say the
-wake phrase first and give the command within eight seconds. Say **“stop
-listening”** (or **“सुनना बंद करो”**) to pause the microphone.
+Install whisper.cpp for Windows and a multilingual model, then copy them into
+`%APPDATA%\JARVIS\voice` as `whisper-cli.exe` and `ggml-small.bin`. Alternatively,
+set `JARVIS_WHISPER_PATH` and `JARVIS_WHISPER_MODEL` in the repository-root
+`.env` file to their full paths (see `.env.example`). Use the official
+whisper.cpp Windows release and multilingual Whisper model; Hindi requires a
+multilingual model, not an English-only model. On Windows, JARVIS speaks using
+Windows SAPI and installed system voices. Install a Hindi speech voice in
+Windows language settings if needed; set `JARVIS_SAPI_VOICE` to an exact SAPI
+voice name to pin one.
 
-Speech recognition uses the speech service provided by Electron/Chromium and
-may require an internet connection; it is not offline, and the speech service
-may process microphone audio. Text-to-speech uses installed system voices.
-Availability and voice quality for each language depend on the machine's speech
-services. Recognition runs only while listening is enabled and while this app
-is open. Hindi commands include `क्रोम खोलो`, `नोटपैड खोलो`, `सिस्टम जानकारी`,
-`फाइल बनाओ <नाम> <टेक्स्ट>`, and `फाइल पढ़ो <नाम>`.
+1. Download a Windows release of `whisper-cli.exe` from
+   [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) and
+   place it in `%APPDATA%\JARVIS\voice`.
+2. Download the multilingual `ggml-small.bin` model from the
+   [whisper.cpp model repository](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true)
+   into the same folder.
+3. If you choose a different location or filename, set both `JARVIS_WHISPER_PATH`
+   and `JARVIS_WHISPER_MODEL` to their full paths in the root `.env`, then
+   restart JARVIS.
+
+Select English, Hindi, or Hinglish, grant microphone access, and leave listening
+enabled. Say **“Hey Jarvis”** or **“हे जार्विस”** to start a conversation
+session; natural follow-ups do not need another wake phrase. The session returns
+to standby after 45 seconds without speech. Say **“stop listening”** or
+**“सुनना बंद करो”** to pause. The
+dashboard can be hidden while the tray and microphone remain active. JARVIS
+uses local voice activity detection and local Whisper transcription; it does
+not use Chromium's online speech recognition. Audio segments are held in memory
+and transient WAV files are removed after transcription; raw recordings are not
+retained by default. Offline transcription requires the configured executable
+and model. Microphone and SAPI behavior still depends on Windows privacy
+settings and installed voices.
 
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.
@@ -55,8 +79,8 @@ resuming communication requires confirmation.
 ## AI conversation
 
 Natural-language requests and follow-up questions use Ollama by default. Install
-Ollama, download a tool-capable model such as `qwen2.5:3b`, and start the Ollama
-service. JARVIS connects to its OpenAI-compatible API at
+Ollama, download the configured tool-capable model such as `qwen2.5:7b`, and
+start the Ollama service. JARVIS connects to its OpenAI-compatible API at
 `http://127.0.0.1:11434/v1`.
 
 To use OpenAI instead, set these variables before starting the desktop app (or
@@ -74,9 +98,32 @@ Conversation context stays in memory for the lifetime of the app; **Clear**
 removes both the visible transcript and that context. AI actions are limited to
 opening Chrome, VS Code, or Notepad; reading, creating, and appending files
 inside the selected workspace; system information; and actions on explicitly
-connected Google accounts. AI cannot run shell commands or delete files. A React portfolio starter can be scaffolded inside
-the workspace and opened directly in VS Code; run `npm install` in that folder
+connected Google accounts. AI cannot run shell commands or delete files. A React
+portfolio starter can be scaffolded inside the workspace as a cancellable
+background task and opened directly in VS Code;
+check **Background tasks** for completion, then run `npm install` in that folder
 before starting its Vite development server.
+
+Use `remind 10m take a break` or ask JARVIS to schedule a reminder. Background
+tasks run concurrently with conversations, appear in **Background tasks**, and
+can be cancelled from the dashboard or with `cancel task <id>`. Completion and
+reminder notifications are spoken when the configured speech output is
+available. Scheduled reminders and task history live in memory only and are
+lost if JARVIS exits or Windows restarts.
+
+## Troubleshooting
+
+- **Voice is Offline:** check that both Whisper paths point to readable files,
+  that `whisper-cli.exe` runs on this Windows version, and that the model is
+  multilingual. Restart JARVIS after changing `.env`.
+- **No microphone input:** allow microphone access in Windows Privacy settings
+  and in the JARVIS app; check the visible mic indicator and unmute/resume from
+  the dashboard or tray.
+- **No spoken response:** check Windows speech settings and install an English
+  or Hindi SAPI voice. Text commands and the dashboard remain available without
+  speech output.
+- **Tray/startup unavailable:** login startup is supported on Windows; use the
+  tray's **Start at login** option and verify Windows startup-app settings.
 
 ## Permissions
 

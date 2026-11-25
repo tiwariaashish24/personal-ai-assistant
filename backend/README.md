@@ -9,7 +9,8 @@ go run ./cmd/jarvis
 Use `-workspace <directory>` to choose where file commands may operate. The
 assistant supports `help`, `open`, `create`, `read`, `append`, `delete`,
 `system`, `permissions`, `permission`, `trash`, `restore`, `integrations`,
-`connect`, `disconnect`, `configure`, `test`, `integration`, and `exit`. Writes
+`connect`, `disconnect`, `configure`, `test`, `integration`, `tasks`, `cancel`,
+`remind`, and `exit`. Writes
 stay inside the workspace; reading another folder requires explicit approval.
 Application launching is limited to Chrome, VS Code, and Notepad; arbitrary
 shell commands are not supported.
@@ -22,7 +23,7 @@ Run the engine tests with `go test ./...`.
 
 Natural-language requests are sent to Ollama by default using its
 OpenAI-compatible endpoint at `http://127.0.0.1:11434/v1`; install Ollama and a
-tool-capable model such as `qwen2.5:3b` to enable AI. To use OpenAI, set
+tool-capable model such as `qwen2.5:7b` to enable AI. To use OpenAI, set
 `JARVIS_AI_PROVIDER=openai` and `OPENAI_API_KEY`. Optional settings:
 `JARVIS_AI_BASE_URL` and `JARVIS_AI_MODEL`. These can be set as environment
 variables or in a `.env` file in the repository root or this directory.
@@ -50,6 +51,11 @@ read-only folder access with
 `permission read remove "<absolute folder>"`; inspect policies with
 `permissions`. File deletion always requires confirmation and moves files to
 recoverable trash; use `trash` and `restore <id>` to recover them.
+
+Schedule reminders with `remind 10m take a break`, list active and recent work
+with `tasks`, and cancel active work with `cancel task <id>`. Tasks use
+cancellable Go contexts and bounded timeouts. Reminder schedules and task
+history remain in memory and are cleared when the assistant exits.
 
 ## Google integrations
 
