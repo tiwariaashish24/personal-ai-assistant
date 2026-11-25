@@ -1,14 +1,19 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"jarvis/internal/config"
+	"jarvis/internal/integrations"
 	"jarvis/internal/permissions"
 )
 
@@ -17,16 +22,27 @@ const helpText = `Commands:
   create <file> <text>          Create a new file
   read <file>                   Read a file
   append <file> <text>          Append text to a file
-  delete <file>                 Delete a file
+  delete <file>                 Move a file to recoverable trash
+  trash                         List recoverable files
+  restore <id>                  Restore a trashed file
   permissions                   Show saved permission policies
   permission read add <folder>  Approve a folder for file reads
   permission read remove <folder> Revoke a folder's read permission
+  integrations                 Show connected communication accounts
+  connect google               Connect Gmail and Google Calendar
+  disconnect google <email>    Revoke a connected Google account
+  configure google             Show Google Cloud OAuth setup
+  test google <email>          Test a Google account connection
+  integration permissions     Show saved communication policies
+  integration permission <provider> <account|*> <action> <recipient|*> <allow|confirm|deny>
+  integration activity [limit] Show recent communication activity
+  integration emergency-stop <on|off> Block or resume communication integrations
   system                        Show CPU, memory, and battery information
   help                          Show this help
   exit                          Quit the assistant
 
-Quote paths or text containing spaces with double quotes. File paths are relative
-to the workspace and cannot access files outside it.
+Quote paths or text containing spaces with double quotes. Writes stay inside the
+workspace; reading another folder requires explicit read permission.
 Natural-language requests and conversation use the configured AI provider.
 
 Hindi examples: क्रोम खोलो, सिस्टम जानकारी, फाइल बनाओ <नाम> <टेक्स्ट>,
@@ -38,13 +54,18 @@ type Result struct {
 	Output       string
 	Exit         bool
 	Confirmation string
+	Data         any
 }
 
 type Engine struct {
-	root        string
-	launch      func(string, ...string) error
-	ai          *aiAssistant
-	permissions *permissions.Store
+	root         string
+	launch       func(string, ...string) error
+	openURL      func(string) error
+	ai           *aiAssistant
+	permissions  *permissions.Store
+	integrations *integrations.Manager
+	pendingMu    sync.Mutex
+	pending      map[string]pendingAction
 }
 
 func (e *Engine) ClearConversation() {
@@ -79,11 +100,18 @@ func New(workspace string) (*Engine, error) {
 		_ = permissionStore.Close()
 		return nil, fmt.Errorf("initialize permissions: %w", err)
 	}
+	integrationManager, err := integrations.NewSystemManager(cfg.DBPath, cfg.GoogleClientID, cfg.GoogleClientSecret)
+	if err != nil {
+		_ = permissionStore.Close()
+		return nil, fmt.Errorf("initialize communication integrations: %w", err)
+	}
 	return &Engine{
-		root:        root,
-		launch:      startApplication,
-		ai:          newAIAssistant(cfg),
-		permissions: permissionStore,
+		root:         root,
+		launch:       startApplication,
+		openURL:      openURL,
+		ai:           newAIAssistant(cfg),
+		permissions:  permissionStore,
+		integrations: integrationManager,
 	}, nil
 }
 
@@ -92,14 +120,31 @@ func (e *Engine) Execute(input string) (Result, error) {
 }
 
 func (e *Engine) ExecuteConfirmed(input string) (Result, error) {
+	if result, found, err := e.executePendingConfirmation(input); found {
+		return result, err
+	}
 	return e.execute(input, true)
 }
 
+func (e *Engine) CancelConfirmation(input string) {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	delete(e.pending, input)
+}
+
 func (e *Engine) Close() error {
-	if e.permissions == nil {
-		return nil
+	var closeErrors []error
+	if e.permissions != nil {
+		if err := e.permissions.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
 	}
-	return e.permissions.Close()
+	if e.integrations != nil {
+		if err := e.integrations.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	return errors.Join(closeErrors...)
 }
 
 func (e *Engine) execute(input string, confirmed bool) (Result, error) {
@@ -164,16 +209,60 @@ func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 			return e.respondToAI(originalInput)
 		}
 		return e.delete(fields[1], confirmed)
+	case "trash":
+		if len(fields) != 1 {
+			return Result{}, errors.New("usage: trash")
+		}
+		return e.listTrash()
+	case "restore":
+		if len(fields) != 2 {
+			return Result{}, errors.New("usage: restore <id>")
+		}
+		return e.restoreFromTrash(fields[1])
 	case "permissions":
 		if len(fields) != 1 {
 			return Result{}, errors.New("usage: permissions")
 		}
 		return e.listPermissions()
+	case "integrations":
+		if len(fields) != 1 {
+			return Result{}, errors.New("usage: integrations")
+		}
+		return e.listIntegrations()
+	case "connect":
+		if len(fields) != 2 {
+			return Result{}, errors.New("usage: connect google")
+		}
+		return e.connectIntegration(fields[1])
+	case "disconnect":
+		if len(fields) != 3 {
+			return Result{}, errors.New("usage: disconnect google <email>")
+		}
+		return e.disconnectIntegration(fields[1], fields[2])
+	case "configure":
+		if len(fields) != 2 {
+			return Result{}, errors.New("usage: configure google")
+		}
+		return e.configureIntegration(fields[1])
+	case "test":
+		if len(fields) != 3 || !strings.EqualFold(fields[1], "google") {
+			return Result{}, errors.New("usage: test google <email>")
+		}
+		return e.testIntegration(fields[1], fields[2])
+	case "integration":
+		return e.manageIntegration(fields, confirmed)
 	case "permission":
 		return e.managePermission(fields)
 	case "system":
 		if len(fields) != 1 {
 			return e.respondToAI(originalInput)
+		}
+		allowed, err := e.permissionAllowed("system_monitor", "*")
+		if err != nil {
+			return Result{}, err
+		}
+		if !allowed {
+			return Result{}, errors.New("system monitoring is not permitted")
 		}
 		return Result{Output: systemSummary(platformStats())}, nil
 	default:
@@ -212,7 +301,199 @@ func (e *Engine) listPermissions() (Result, error) {
 	for _, entry := range entries {
 		fmt.Fprintf(&output, "  %-12s %-7s %s\n", entry.Action, entry.Decision, entry.Resource)
 	}
-	output.WriteString("  Gmail, email sending, and payments are unavailable until their integrations are configured.")
+	output.WriteString("Automatic: approved reads, workspace writes, allowlisted apps, and system monitoring.\n")
+	output.WriteString("Confirmation: file deletion moves items to recoverable trash.\n")
+	output.WriteString("Unavailable: email, notifications, file organization, reminders, downloads, and system settings need integrations.\n")
+	output.WriteString("Transfers require mandatory authentication and a payment integration; permanent deletion is not exposed.")
+	return Result{Output: output.String()}, nil
+}
+
+func (e *Engine) listIntegrations() (Result, error) {
+	statuses, err := e.integrations.Status()
+	if err != nil {
+		return Result{}, err
+	}
+	var output strings.Builder
+	output.WriteString("Communication integrations:\n")
+	if len(statuses) > 0 && statuses[0].EmergencyStopped {
+		output.WriteString("  EMERGENCY STOP ACTIVE: communication APIs are blocked.\n")
+	}
+	for _, status := range statuses {
+		if len(status.Accounts) == 0 {
+			if status.Configured {
+				fmt.Fprintf(&output, "  %s: configured, not connected\n", status.Name)
+			} else {
+				fmt.Fprintf(&output, "  %s: not configured, not connected\n", status.Name)
+			}
+		}
+		for _, account := range status.Accounts {
+			fmt.Fprintf(&output, "  %s: connected as %s\n", status.Name, account.Email)
+		}
+	}
+	output.WriteString("  Gmail and Google Calendar: available after Google OAuth setup and account connection.\n")
+	output.WriteString("  Outlook and other services: not implemented yet; they are not being simulated.")
+	return Result{Output: output.String(), Data: statuses}, nil
+}
+
+func (e *Engine) connectIntegration(provider string) (Result, error) {
+	if !strings.EqualFold(provider, integrations.Google) {
+		return Result{}, fmt.Errorf("provider %q is not implemented yet; Google is the first supported integration", provider)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	account, err := e.executeAndAudit(integrations.AuditEvent{
+		Provider: integrations.Google,
+		Action:   "connect_account",
+		Target:   integrations.Google,
+	}, func() (string, error) {
+		account, err := e.integrations.Connect(ctx, integrations.Google, e.openURL)
+		if err != nil {
+			return "", err
+		}
+		return account.Email, nil
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Output: "Connected Google account " + account + ". Gmail and Google Calendar are ready."}, nil
+}
+
+func (e *Engine) disconnectIntegration(provider, email string) (Result, error) {
+	if !strings.EqualFold(provider, integrations.Google) {
+		return Result{}, fmt.Errorf("provider %q is not implemented yet", provider)
+	}
+	email = strings.ToLower(email)
+	output, err := e.executeAndAudit(integrations.AuditEvent{
+		Provider: integrations.Google,
+		Account:  email,
+		Action:   "disconnect_account",
+		Target:   email,
+	}, func() (string, error) {
+		return "Disconnected " + email + " and removed its saved Google credentials.", e.integrations.Disconnect(strings.ToLower(provider), email)
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Output: output}, nil
+}
+
+func (e *Engine) configureIntegration(provider string) (Result, error) {
+	if !strings.EqualFold(provider, integrations.Google) {
+		return Result{}, fmt.Errorf("provider %q is not implemented yet", provider)
+	}
+	return Result{Output: strings.Join([]string{
+		"Google OAuth setup:",
+		"1. In Google Cloud Console, create or select a project and enable Gmail API and Google Calendar API.",
+		"2. Configure the OAuth consent screen and add your account as a test user while the app is in testing.",
+		"3. Create an OAuth client ID for a Desktop app.",
+		"4. Set JARVIS_GOOGLE_CLIENT_ID in the backend .env file. Set JARVIS_GOOGLE_CLIENT_SECRET only if Google provides one.",
+		"5. Restart JARVIS, run connect google, then approve the requested scopes in Google's consent screen.",
+		"Scopes: openid, userinfo.email, gmail.modify, gmail.send, calendar.events.",
+		"Google may require verification for Gmail scopes before allowing users outside your test list.",
+	}, "\n")}, nil
+}
+
+func (e *Engine) testIntegration(provider, email string) (Result, error) {
+	if !strings.EqualFold(provider, integrations.Google) {
+		return Result{}, fmt.Errorf("provider %q is not implemented yet", provider)
+	}
+	output, err := e.executeAndAudit(integrations.AuditEvent{
+		Provider: integrations.Google,
+		Account:  strings.ToLower(email),
+		Action:   "test_connection",
+		Target:   email,
+	}, func() (string, error) {
+		return e.integrations.TestGoogleConnection(context.Background(), email)
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Output: output}, nil
+}
+
+func (e *Engine) manageIntegration(fields []string, confirmed bool) (Result, error) {
+	if len(fields) == 3 && strings.EqualFold(fields[1], "emergency-stop") {
+		switch strings.ToLower(fields[2]) {
+		case "on":
+			if err := e.integrations.SetEmergencyStopped(true); err != nil {
+				return Result{}, err
+			}
+			return Result{Output: "Emergency stop enabled; Google communication APIs are blocked."}, nil
+		case "off":
+			if !confirmed {
+				return Result{Confirmation: "Turn off the communication emergency stop?"}, nil
+			}
+			if err := e.integrations.SetEmergencyStopped(false); err != nil {
+				return Result{}, err
+			}
+			return Result{Output: "Emergency stop disabled; saved Google permissions are active again."}, nil
+		default:
+			return Result{}, errors.New("usage: integration emergency-stop <on|off>")
+		}
+	}
+	if len(fields) == 2 && strings.EqualFold(fields[1], "permissions") {
+		entries, err := e.integrations.Permissions()
+		if err != nil {
+			return Result{}, err
+		}
+		if len(entries) == 0 {
+			return Result{Output: "No custom communication permissions are saved. Reads are allowed after account consent; sends and changes require confirmation by default."}, nil
+		}
+		var output strings.Builder
+		output.WriteString("Saved communication permissions:\n")
+		for _, entry := range entries {
+			fmt.Fprintf(&output, "  %-8s %-28s %-20s %-32s %s\n",
+				entry.Provider, entry.Account, entry.Action, entry.Resource, entry.Decision)
+		}
+		return Result{Output: output.String()}, nil
+	}
+	if len(fields) == 7 && strings.EqualFold(fields[1], "permission") {
+		provider := strings.ToLower(fields[2])
+		account := strings.ToLower(fields[3])
+		action := strings.ToLower(fields[4])
+		resource := strings.TrimSpace(fields[5])
+		decision := strings.ToLower(fields[6])
+		if provider != integrations.Google {
+			return Result{}, errors.New("only the google provider is currently implemented")
+		}
+		if account == "*" {
+			if err := e.integrations.SetPermission(provider, action, resource, decision); err != nil {
+				return Result{}, err
+			}
+		} else {
+			if err := e.integrations.SetAccountPermission(provider, account, action, resource, decision); err != nil {
+				return Result{}, err
+			}
+		}
+		return Result{Output: fmt.Sprintf("Saved %s permission for %s on %s (%s).", decision, action, resource, account)}, nil
+	}
+	if len(fields) == 2 && strings.EqualFold(fields[1], "activity") {
+		return e.integrationActivity(50)
+	}
+	if len(fields) == 3 && strings.EqualFold(fields[1], "activity") {
+		limit, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return Result{}, errors.New("activity limit must be a number from 1 to 500")
+		}
+		return e.integrationActivity(limit)
+	}
+	return Result{}, errors.New("usage: integration permissions | integration permission <provider> <account|*> <action> <recipient|*> <allow|confirm|deny> | integration activity [limit] | integration emergency-stop <on|off>")
+}
+
+func (e *Engine) integrationActivity(limit int) (Result, error) {
+	events, err := e.integrations.AuditTrail(limit)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(events) == 0 {
+		return Result{Output: "No communication activity has been recorded."}, nil
+	}
+	var output strings.Builder
+	output.WriteString("Recent communication activity (message contents are not logged):\n")
+	for _, event := range events {
+		fmt.Fprintf(&output, "  %s %-8s %-28s %-20s %-24s %s\n",
+			event.CreatedAt.Local().Format(time.RFC3339), event.Provider, event.Account, event.Action, event.Target, event.Result)
+	}
 	return Result{Output: output.String()}, nil
 }
 
@@ -258,14 +539,20 @@ func (e *Engine) respondToAI(input string) (Result, error) {
 	if e.ai == nil {
 		return Result{}, fmt.Errorf("%w: type help for commands", ErrUnknownCommand)
 	}
-	reply, err := e.ai.respond(input, e.runAITool)
+	reply, err := e.ai.respond(input, func(name string, arguments json.RawMessage) (string, error) {
+		return e.runAITool(input, name, arguments)
+	})
 	if err != nil {
+		var confirmation *confirmationRequiredError
+		if errors.As(err, &confirmation) {
+			return Result{Confirmation: confirmation.prompt}, nil
+		}
 		return Result{}, err
 	}
 	return Result{Output: reply}, nil
 }
 
-func (e *Engine) runAITool(name string, arguments json.RawMessage) (string, error) {
+func (e *Engine) runAITool(input, name string, arguments json.RawMessage) (string, error) {
 	switch name {
 	case "open_app":
 		var args struct {
@@ -356,7 +643,18 @@ func (e *Engine) runAITool(name string, arguments json.RawMessage) (string, erro
 		if err := decodeToolArguments(arguments, &args); err != nil {
 			return "", err
 		}
+		allowed, err := e.permissionAllowed("system_monitor", "*")
+		if err != nil {
+			return "", err
+		}
+		if !allowed {
+			return "", errors.New("system monitoring is not permitted")
+		}
 		return systemSummary(platformStats()), nil
+	case "search_gmail", "read_gmail_message", "send_gmail", "reply_gmail", "forward_gmail",
+		"archive_gmail", "trash_gmail", "download_gmail_attachment", "list_google_calendar",
+		"create_google_event", "update_google_event", "delete_google_event":
+		return e.runGoogleAITool(input, name, arguments)
 	default:
 		return "", fmt.Errorf("unsupported AI tool %q", name)
 	}
@@ -604,6 +902,10 @@ func normalizeHindiCommand(input string) string {
 }
 
 func (e *Engine) create(name, content string) (Result, error) {
+	return e.createBytes(name, []byte(content))
+}
+
+func (e *Engine) createBytes(name string, content []byte) (Result, error) {
 	allowed, err := e.permissionAllowed("create_file", e.root)
 	if err != nil {
 		return Result{}, err
@@ -619,7 +921,7 @@ func (e *Engine) create(name, content string) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("create file: %w", err)
 	}
-	_, writeErr := file.WriteString(content)
+	_, writeErr := file.Write(content)
 	closeErr := file.Close()
 	if writeErr != nil {
 		if removeErr := os.Remove(path); removeErr != nil {
@@ -701,12 +1003,13 @@ func (e *Engine) delete(name string, confirmed bool) (Result, error) {
 		return Result{}, errors.New("deleting files is not permitted in this workspace")
 	}
 	if decision == permissions.Confirm && !confirmed {
-		return Result{Confirmation: fmt.Sprintf("Delete %q? This cannot be undone.", name)}, nil
+		return Result{Confirmation: fmt.Sprintf("Move %q to recoverable trash?", name)}, nil
 	}
-	if err := os.Remove(path); err != nil {
-		return Result{}, fmt.Errorf("delete file: %w", err)
+	id, err := e.moveToTrash(path)
+	if err != nil {
+		return Result{}, err
 	}
-	return Result{Output: "Deleted " + name + "."}, nil
+	return Result{Output: fmt.Sprintf("Moved %s to recoverable trash. ID: %s", name, id)}, nil
 }
 
 func (e *Engine) readableFilePath(name string) (string, error) {
@@ -722,6 +1025,9 @@ func (e *Engine) readableFilePath(name string) (string, error) {
 		path, err = filepath.EvalSymlinks(name)
 		if err != nil {
 			return "", fmt.Errorf("resolve file: %w", err)
+		}
+		if e.isInternalTrashPath(path) {
+			return "", errors.New("trash storage is managed by JARVIS")
 		}
 		info, err := os.Stat(path)
 		if err != nil {
@@ -786,6 +1092,9 @@ func (e *Engine) relativePath(name string) (string, error) {
 		return "", errors.New("file path must be relative to the workspace")
 	}
 	path := filepath.Clean(name)
+	if strings.EqualFold(path, trashDirectory) || strings.HasPrefix(strings.ToLower(path), strings.ToLower(trashDirectory+string(filepath.Separator))) {
+		return "", errors.New("trash storage is managed by JARVIS")
+	}
 	if path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
 		return "", errors.New("file path must stay inside the workspace")
 	}
@@ -793,6 +1102,15 @@ func (e *Engine) relativePath(name string) (string, error) {
 		return "", errors.New("file path must stay inside the workspace")
 	}
 	return path, nil
+}
+
+func (e *Engine) isInternalTrashPath(path string) bool {
+	relative, err := filepath.Rel(e.root, path)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(relative, trashDirectory) ||
+		strings.HasPrefix(strings.ToLower(relative), strings.ToLower(trashDirectory+string(filepath.Separator)))
 }
 
 func withinRoot(root, path string) bool {

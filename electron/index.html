@@ -27,6 +27,7 @@
             </select>
           </label>
           <button id="workspace-button" class="workspace-button" type="button">Workspace</button>
+          <button id="integrations-button" class="workspace-button" type="button">Connections</button>
         </div>
       </header>
 
@@ -67,6 +68,19 @@
           <span>·</span>
           <button type="button" data-command="help">help</button>
         </p>
+      </section>
+
+      <section class="integrations-panel" aria-labelledby="integrations-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="integrations-title">Connected applications</h2>
+            <p class="integrations-intro">Connect services using their official authorization flow. Credentials stay in the OS credential vault.</p>
+          </div>
+          <button id="refresh-integrations" class="clear-button" type="button">Refresh</button>
+        </div>
+        <div id="integrations-list" class="integrations-list" aria-live="polite">
+          <p class="empty-state">Loading connection status…</p>
+        </div>
       </section>
 
       <section class="conversation-panel" aria-labelledby="conversation-title">

@@ -100,15 +100,16 @@ async function executeCommand(command) {
   }
   const confirmation = await dialog.showMessageBox(mainWindow, {
     type: "warning",
-    title: "Confirm file deletion",
+    title: "Confirm JARVIS action",
     message: result.confirmation,
-    detail: "This action cannot be undone.",
-    buttons: ["Cancel", "Delete"],
+    detail: "JARVIS will only perform the action described above after you approve it.",
+    buttons: ["Cancel", "Confirm"],
     defaultId: 0,
     cancelId: 0,
     noLink: true,
   });
   if (confirmation.response !== 1) {
+    await sendAssistantRequest({ command, cancelConfirmation: true });
     return { output: "Cancelled. No changes were made." };
   }
   return sendAssistantRequest({ command, confirmed: true });
@@ -136,6 +137,12 @@ function registerIPC() {
       throw new Error("Untrusted workspace request.");
     }
     return workspaceDirectory;
+  });
+  ipcMain.handle("jarvis:integrations", async (event) => {
+    if (!isTrustedWindow(event)) {
+      throw new Error("Untrusted integrations request.");
+    }
+    return sendAssistantRequest({ command: "integrations" });
   });
   ipcMain.handle("jarvis:choose-workspace", async (event) => {
     if (!isTrustedWindow(event)) {

@@ -24,6 +24,9 @@ type Config struct {
 	AIModel string
 	// OpenAIKey is the API key used only by the OpenAI provider.
 	OpenAIKey string
+	// GoogleClientID and GoogleClientSecret configure the local Google OAuth app.
+	GoogleClientID     string
+	GoogleClientSecret string
 }
 
 func Load() *Config {
@@ -31,14 +34,16 @@ func Load() *Config {
 	loadDotEnv("../.env")
 
 	cfg := &Config{
-		Addr:           envOr("JARVIS_API_ADDR", "127.0.0.1:8080"),
-		DBPath:         envOr("JARVIS_DB_PATH", defaultDBPath()),
-		NodeServiceURL: envOr("JARVIS_NODE_URL", "http://127.0.0.1:8787"),
-		EnableVoice:    envOr("JARVIS_VOICE", "true") != "false",
-		AIProvider:     envOr("JARVIS_AI_PROVIDER", "ollama"),
-		AIBaseURL:      os.Getenv("JARVIS_AI_BASE_URL"),
-		AIModel:        os.Getenv("JARVIS_AI_MODEL"),
-		OpenAIKey:      os.Getenv("OPENAI_API_KEY"),
+		Addr:               envOr("JARVIS_API_ADDR", "127.0.0.1:8080"),
+		DBPath:             envOr("JARVIS_DB_PATH", defaultDBPath()),
+		NodeServiceURL:     envOr("JARVIS_NODE_URL", "http://127.0.0.1:8787"),
+		EnableVoice:        envOr("JARVIS_VOICE", "true") != "false",
+		AIProvider:         envOr("JARVIS_AI_PROVIDER", "ollama"),
+		AIBaseURL:          os.Getenv("JARVIS_AI_BASE_URL"),
+		AIModel:            os.Getenv("JARVIS_AI_MODEL"),
+		OpenAIKey:          os.Getenv("OPENAI_API_KEY"),
+		GoogleClientID:     os.Getenv("JARVIS_GOOGLE_CLIENT_ID"),
+		GoogleClientSecret: os.Getenv("JARVIS_GOOGLE_CLIENT_SECRET"),
 	}
 	return cfg
 }

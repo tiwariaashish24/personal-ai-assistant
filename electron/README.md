@@ -32,6 +32,26 @@ is open. Hindi commands include `क्रोम खोलो`, `नोटपै
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.
 
+## Connected applications
+
+The **Connections** panel lists configured and connected Google accounts and
+provides **Connect**, **Disconnect**, **Configure**, and **Test connection**
+actions. Configure a Google Desktop OAuth client by following
+[backend Google integration setup](../backend/README.md#google-integrations).
+OAuth happens in the system browser; JARVIS listens only on a temporary
+loopback callback and stores tokens in the OS credential vault.
+
+Once connected, use natural language to search/read Gmail and manage Google
+Calendar. Sending email, forwarding/replying, archiving messages, downloading
+attachments, and modifying calendar events are confirmation-gated unless a
+persistent permission explicitly allows the action. Moving messages to Trash
+and deleting calendar events always require confirmation. Unknown recipients
+always require confirmation; multiple recipients and detected sensitive data
+also require confirmation. Manage recipient permissions and review activity
+from the backend with `integration permissions`, `integration permission`, and
+`integration activity`. The Connections panel also provides an emergency stop;
+resuming communication requires confirmation.
+
 ## AI conversation
 
 Natural-language requests and follow-up questions use Ollama by default. Install
@@ -53,8 +73,8 @@ Optional settings are `JARVIS_AI_PROVIDER=ollama|openai`,
 Conversation context stays in memory for the lifetime of the app; **Clear**
 removes both the visible transcript and that context. AI actions are limited to
 opening Chrome, VS Code, or Notepad; reading, creating, and appending files
-inside the selected workspace; and system information. AI cannot run shell
-commands or delete files. A React portfolio starter can be scaffolded inside
+inside the selected workspace; system information; and actions on explicitly
+connected Google accounts. AI cannot run shell commands or delete files. A React portfolio starter can be scaffolded inside
 the workspace and opened directly in VS Code; run `npm install` in that folder
 before starting its Vite development server.
 
@@ -69,7 +89,9 @@ review saved policies. Approve an additional read-only folder with
 `permission read remove "C:\path\to\folder"`. External folder access is
 read-only; writes remain restricted to the selected workspace.
 
-Every file deletion asks for confirmation in the desktop app (or the CLI) and
-never deletes before confirmation. JARVIS currently has no Gmail, email-sending,
-or payment integration; those actions remain unavailable until account/OAuth
-and service integrations are implemented.
+Every file deletion asks for confirmation and moves the file into recoverable
+workspace trash. Run `trash` to see items and `restore <id>` to recover one.
+Gmail and Google Calendar are available after OAuth setup and account
+connection. Outlook, social messaging, SMS, and payment integrations are not
+implemented yet. Transfers require mandatory authentication when a payment
+integration is added, and permanent deletion is not exposed.

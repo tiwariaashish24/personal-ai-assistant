@@ -250,6 +250,7 @@ h1 {
 }
 
 .command-panel,
+.integrations-panel,
 .conversation-panel {
   border: 1px solid var(--line);
   border-radius: 15px;
@@ -258,6 +259,76 @@ h1 {
 
 .command-panel {
   padding: 16px;
+}
+
+.integrations-panel {
+  margin-top: 15px;
+  padding: 16px;
+}
+
+.integrations-intro {
+  margin: 7px 0 0;
+  color: #7887a0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.integrations-list {
+  display: grid;
+  margin-top: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+}
+
+.integration-card {
+  padding: 13px;
+  border: 1px solid rgba(159, 181, 220, 0.12);
+  border-radius: 10px;
+  background: rgba(5, 10, 20, 0.48);
+}
+
+.integration-card h3 {
+  margin: 0;
+  color: #d7e3f5;
+  font-size: 13px;
+}
+
+.integration-card p,
+.integration-capabilities {
+  color: #8290a9;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.integration-card p {
+  margin: 7px 0 10px;
+}
+
+.integration-capabilities {
+  margin: 0 0 12px;
+  padding-left: 17px;
+}
+
+.integration-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.integration-actions button {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid rgba(102, 228, 255, 0.28);
+  border-radius: 7px;
+  background: rgba(19, 37, 59, 0.8);
+  color: #b9d8ee;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.integration-actions button:hover {
+  border-color: rgba(102, 228, 255, 0.62);
+  color: #effaff;
 }
 
 #command-form {

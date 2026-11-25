@@ -74,6 +74,7 @@ func (s *Store) Initialize(workspace string) error {
 		{Action: "create_file", Resource: workspace, Decision: Allow},
 		{Action: "append_file", Resource: workspace, Decision: Allow},
 		{Action: "delete_file", Resource: workspace, Decision: Confirm},
+		{Action: "system_monitor", Resource: "*", Decision: Allow},
 	}
 	for _, entry := range defaults {
 		if _, err := s.db.Exec(`

@@ -8,6 +8,7 @@ const commandForm = document.querySelector("#command-form");
 const commandInput = document.querySelector("#command-input");
 const workspacePath = document.querySelector("#workspace-path");
 const microphonePrivacy = document.querySelector("#microphone-privacy");
+const integrationsList = document.querySelector("#integrations-list");
 
 let recognition;
 let listening = false;
@@ -154,6 +155,115 @@ function removeWakeWord(text) {
     }
   }
   return null;
+}
+
+function addIntegrationButton(container, action, account) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.integrationAction = action;
+  if (account) {
+    button.dataset.account = account;
+  }
+  const labels = {
+    connect: "Connect",
+    configure: "Configure",
+    test: "Test connection",
+    disconnect: "Disconnect",
+    "emergency-stop-on": "Emergency stop",
+    "emergency-stop-off": "Resume communications",
+  };
+  button.textContent = labels[action];
+  container.append(button);
+}
+
+function renderIntegrations(statuses) {
+  integrationsList.replaceChildren();
+  for (const status of statuses || []) {
+    const card = document.createElement("article");
+    card.className = "integration-card";
+
+    const title = document.createElement("h3");
+    title.textContent = status.name;
+    card.append(title);
+
+    const connectedAccounts = Array.isArray(status.accounts) ? status.accounts : [];
+    const summary = document.createElement("p");
+    summary.textContent = connectedAccounts.length
+      ? `${connectedAccounts.length} account${connectedAccounts.length === 1 ? "" : "s"} connected`
+      : status.configured
+        ? "OAuth configured; no account connected"
+        : "OAuth client not configured";
+    card.append(summary);
+    if (status.emergencyStopped) {
+      const notice = document.createElement("p");
+      notice.textContent = "Emergency stop is active.";
+      card.append(notice);
+    }
+
+    const capabilities = document.createElement("ul");
+    capabilities.className = "integration-capabilities";
+    for (const capability of status.capabilities || []) {
+      const item = document.createElement("li");
+      item.textContent = capability;
+      capabilities.append(item);
+    }
+    card.append(capabilities);
+
+    const providerActions = document.createElement("div");
+    providerActions.className = "integration-actions";
+    if (status.provider === "google") {
+      addIntegrationButton(providerActions, "connect");
+      addIntegrationButton(providerActions, status.emergencyStopped ? "emergency-stop-off" : "emergency-stop-on");
+    }
+    addIntegrationButton(providerActions, "configure");
+    card.append(providerActions);
+
+    for (const account of connectedAccounts) {
+      const accountRow = document.createElement("p");
+      accountRow.textContent = account.email;
+      card.append(accountRow);
+      const accountActions = document.createElement("div");
+      accountActions.className = "integration-actions";
+      addIntegrationButton(accountActions, "test", account.email);
+      addIntegrationButton(accountActions, "disconnect", account.email);
+      card.append(accountActions);
+    }
+    integrationsList.append(card);
+  }
+}
+
+async function loadIntegrations() {
+  try {
+    const result = await window.jarvis.getIntegrations();
+    renderIntegrations(result.data);
+  } catch (error) {
+    integrationsList.replaceChildren();
+    const message = document.createElement("p");
+    message.className = "empty-state";
+    message.textContent = `Could not load connections: ${error.message}`;
+    integrationsList.append(message);
+  }
+}
+
+async function runIntegrationAction(action, account) {
+  let command;
+  if (action === "connect") {
+    command = "connect google";
+  } else if (action === "emergency-stop-on") {
+    command = "integration emergency-stop on";
+  } else if (action === "emergency-stop-off") {
+    command = "integration emergency-stop off";
+  } else if (action === "configure") {
+    command = "configure google";
+  } else if (action === "test" && account) {
+    command = `test google "${account}"`;
+  } else if (action === "disconnect" && account) {
+    command = `disconnect google "${account}"`;
+  } else {
+    return;
+  }
+  await executeCommand(command, false);
+  await loadIntegrations();
 }
 
 async function executeCommand(command, spoken = true) {
@@ -337,6 +447,19 @@ document.querySelector("#workspace-button").addEventListener("click", async () =
   }
 });
 
+document.querySelector("#integrations-button").addEventListener("click", () => {
+  document.querySelector(".integrations-panel").scrollIntoView({ behavior: "smooth", block: "center" });
+});
+document.querySelector("#refresh-integrations").addEventListener("click", () => {
+  void loadIntegrations();
+});
+integrationsList.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-integration-action]");
+  if (button) {
+    void runIntegrationAction(button.dataset.integrationAction, button.dataset.account);
+  }
+});
+
 if (SpeechRecognition) {
   microphoneButton.disabled = false;
 }
@@ -346,3 +469,4 @@ window.jarvis.getWorkspace().then((workspace) => {
 }).catch((error) => {
   setStatus(`Could not load workspace: ${error.message}`);
 });
+void loadIntegrations();

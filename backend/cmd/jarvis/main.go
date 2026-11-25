@@ -56,6 +56,7 @@ func main() {
 			if strings.EqualFold(strings.TrimSpace(scanner.Text()), "y") {
 				result, err = assistant.ExecuteConfirmed(command)
 			} else {
+				assistant.CancelConfirmation(command)
 				result.Output = "Cancelled. No changes were made."
 			}
 		}
@@ -80,9 +81,10 @@ func main() {
 }
 
 type stdioRequest struct {
-	Command           string `json:"command"`
-	ClearConversation bool   `json:"clearConversation,omitempty"`
-	Confirmed         bool   `json:"confirmed,omitempty"`
+	Command            string `json:"command"`
+	ClearConversation  bool   `json:"clearConversation,omitempty"`
+	Confirmed          bool   `json:"confirmed,omitempty"`
+	CancelConfirmation bool   `json:"cancelConfirmation,omitempty"`
 }
 
 type stdioResponse struct {
@@ -90,6 +92,7 @@ type stdioResponse struct {
 	Exit         bool   `json:"exit,omitempty"`
 	Error        string `json:"error,omitempty"`
 	Confirmation string `json:"confirmation,omitempty"`
+	Data         any    `json:"data,omitempty"`
 }
 
 func runStdio(assistant *engine.Engine) error {
@@ -103,6 +106,9 @@ func runStdio(assistant *engine.Engine) error {
 			response.Error = fmt.Sprintf("invalid request: %v", err)
 		} else if request.ClearConversation {
 			assistant.ClearConversation()
+		} else if request.CancelConfirmation {
+			assistant.CancelConfirmation(request.Command)
+			response.Output = "Cancelled. No changes were made."
 		} else {
 			var result engine.Result
 			var err error
@@ -118,6 +124,7 @@ func runStdio(assistant *engine.Engine) error {
 				response.Output = result.Output
 				response.Exit = result.Exit
 				response.Confirmation = result.Confirmation
+				response.Data = result.Data
 			}
 		}
 		if err := json.NewEncoder(writer).Encode(response); err != nil {

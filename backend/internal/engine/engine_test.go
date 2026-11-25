@@ -49,16 +49,66 @@ func TestFileCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Confirmation == "" {
-		t.Fatal("expected a confirmation before deleting a file")
+		t.Fatal("expected a confirmation before moving a file to trash")
 	}
 	if _, err := os.Stat(filepath.Join(root, "notes file.txt")); err != nil {
 		t.Fatalf("file was deleted before confirmation: %v", err)
 	}
-	if _, err := assistant.ExecuteConfirmed(`delete "notes file.txt"`); err != nil {
+	result, err = assistant.ExecuteConfirmed(`delete "notes file.txt"`)
+	if err != nil {
 		t.Fatal(err)
 	}
+	_, confirmationID, ok := strings.Cut(result.Output, "ID: ")
+	if !ok || len(confirmationID) != 32 {
+		t.Fatalf("delete result did not include a recoverable trash id: %q", result.Output)
+	}
 	if _, err := os.Stat(filepath.Join(root, "notes file.txt")); !os.IsNotExist(err) {
-		t.Fatalf("expected file to be deleted, stat error: %v", err)
+		t.Fatalf("expected file to be moved to trash, stat error: %v", err)
+	}
+	if _, err := assistant.Execute(`create "notes file.txt" replacement`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := assistant.Execute("restore " + confirmationID); err == nil {
+		t.Fatal("expected restore to refuse overwriting an existing file")
+	}
+	if err := os.Remove(filepath.Join(root, "notes file.txt")); err != nil {
+		t.Fatal(err)
+	}
+	trash, err := assistant.Execute("trash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(trash.Output, confirmationID) {
+		t.Fatalf("trash listing did not include id %q: %s", confirmationID, trash.Output)
+	}
+	restored, err := assistant.Execute("restore " + confirmationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Output != "Restored notes file.txt." {
+		t.Fatalf("restore returned %q", restored.Output)
+	}
+	content, err := os.ReadFile(filepath.Join(root, "notes file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "hello world again" {
+		t.Fatalf("restored file contains %q", content)
+	}
+}
+
+func TestCreateBytesPreservesBinaryFileContents(t *testing.T) {
+	assistant, root := newTestEngine(t)
+	want := []byte{0, 0xff, 0x80, 'J', 'A', 'R', 'V', 'I', 'S'}
+	if _, err := assistant.createBytes("attachment.pdf", want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "attachment.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("written bytes = %v, want %v", got, want)
 	}
 }
 
@@ -88,6 +138,33 @@ func TestReadNeedsApprovedFolderAndCanBeRevoked(t *testing.T) {
 	}
 	if _, err := assistant.Execute("read " + quotedPath); err == nil {
 		t.Fatal("expected revoked folder read to be rejected")
+	}
+}
+
+func TestInternalTrashCannotBeManagedAsWorkspaceFile(t *testing.T) {
+	assistant, _ := newTestEngine(t)
+	if _, err := assistant.Execute(`create .jarvis-trash/file.txt content`); err == nil {
+		t.Fatal("expected direct file creation in internal trash to be rejected")
+	}
+}
+
+func TestDeleteRefusesUnrecognizedExistingTrashDirectory(t *testing.T) {
+	assistant, root := newTestEngine(t)
+	trashRoot := filepath.Join(root, trashDirectory)
+	if err := os.Mkdir(trashRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := assistant.Execute("delete keep.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := assistant.ExecuteConfirmed("delete keep.txt"); err == nil {
+		t.Fatal("expected deletion to reject an unrecognized trash directory")
+	}
+	if content, err := os.ReadFile(filepath.Join(root, "keep.txt")); err != nil || string(content) != "keep" {
+		t.Fatalf("original file was changed: %q, %v", content, err)
 	}
 }
 

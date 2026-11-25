@@ -51,6 +51,31 @@ func startApplication(name string, args ...string) error {
 	return fmt.Errorf("%s was not found; install it or add it to PATH", name)
 }
 
+func openURL(value string) error {
+	var executable string
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		executable = "rundll32.exe"
+		args = []string{"url.dll,FileProtocolHandler", value}
+	case "darwin":
+		executable = "open"
+		args = []string{value}
+	default:
+		executable = "xdg-open"
+		args = []string{value}
+	}
+	path, err := exec.LookPath(executable)
+	if err != nil {
+		return fmt.Errorf("find browser opener %s: %w", executable, err)
+	}
+	cmd := exec.Command(path, args...)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start browser opener: %w", err)
+	}
+	return cmd.Process.Release()
+}
+
 func resolveExecutable(candidate string) (string, error) {
 	if filepath.IsAbs(candidate) {
 		info, err := os.Stat(candidate)
