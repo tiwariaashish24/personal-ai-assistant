@@ -28,6 +28,7 @@ let segmenter;
 let bargeInDetector;
 let bargeInRequested = false;
 let processing = false;
+let streamingMessage;
 let transcriptionQueue = Promise.resolve();
 let commandQueue = Promise.resolve();
 let currentSpokenText = "";
@@ -71,6 +72,37 @@ function addMessage(role, text) {
   message.textContent = text;
   conversation.append(message);
   conversation.scrollTop = conversation.scrollHeight;
+}
+
+function appendAssistantDelta(delta) {
+  if (typeof delta !== "string" || delta.length === 0) {
+    return;
+  }
+  if (!streamingMessage) {
+    conversation.querySelector(".empty-state")?.remove();
+    streamingMessage = document.createElement("div");
+    streamingMessage.className = "message assistant streaming";
+    conversation.append(streamingMessage);
+  }
+  streamingMessage.textContent += delta;
+  conversation.scrollTop = conversation.scrollHeight;
+}
+
+function finishAssistantStream(text) {
+  if (streamingMessage) {
+    streamingMessage.textContent = text;
+    streamingMessage.classList.remove("streaming");
+    streamingMessage = undefined;
+  } else {
+    addMessage("assistant", text);
+  }
+}
+
+function discardAssistantStream() {
+  if (streamingMessage) {
+    streamingMessage.remove();
+    streamingMessage = undefined;
+  }
 }
 
 async function speak(text) {
@@ -331,11 +363,10 @@ async function handleTranscript(transcript) {
     currentSpokenText = "";
     spokenEchoWindowUntil = 0;
   }
-  const wake = voiceCore.extractWakeCommand(transcript);
-  if (!activeConversation && !wake.activated) {
+  const command = voiceCore.resolveConversationCommand(transcript, activeConversation);
+  if (command === null) {
     return;
   }
-  const command = wake.activated ? wake.command : transcript.trim();
   if (isPausePhrase(command || transcript)) {
     await window.jarvis.setVoiceControl("pause");
     return;
@@ -542,13 +573,14 @@ async function executeCommand(command, spoken = true) {
   }
 
   processing = true;
+  discardAssistantStream();
   document.body.classList.remove("is-awake");
   addMessage("user", trimmed);
   setVoiceState("Thinking", "Working on your request.");
   try {
-    const result = await window.jarvis.executeCommand(trimmed);
+    const result = await window.jarvis.executeCommand(trimmed, true);
     const reply = result.output || "Done.";
-    addMessage("assistant", reply);
+    finishAssistantStream(reply);
     if (spoken) {
       try {
         await speak(spokenReply(trimmed, reply));
@@ -557,6 +589,7 @@ async function executeCommand(command, spoken = true) {
       }
     }
   } catch (error) {
+    discardAssistantStream();
     addMessage("assistant", error.message);
     setVoiceState("Error", "I couldn't complete that command.");
     if (spoken) {
@@ -674,6 +707,10 @@ window.jarvis.onVoiceState((update) => {
       voiceDetail.textContent = update.detail;
     }
   }
+});
+
+window.jarvis.onAssistantDelta((update) => {
+  appendAssistantDelta(update?.delta);
 });
 
 async function initializeDesktop() {

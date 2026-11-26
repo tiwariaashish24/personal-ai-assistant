@@ -20,30 +20,53 @@ login by default.
 
 ## Voice
 
-Install whisper.cpp for Windows and a multilingual model, then copy them into
-`%APPDATA%\JARVIS\voice` as `whisper-cli.exe` and `ggml-small.bin`. Alternatively,
-set `JARVIS_WHISPER_PATH` and `JARVIS_WHISPER_MODEL` in the repository-root
-`.env` file to their full paths (see `.env.example`). Use the official
-whisper.cpp Windows release and multilingual Whisper model; Hindi requires a
-multilingual model, not an English-only model. On Windows, JARVIS speaks using
-Windows SAPI and installed system voices. Install a Hindi speech voice in
-Windows language settings if needed; set `JARVIS_SAPI_VOICE` to an exact SAPI
-voice name to pin one.
+The installer installs the CPU-optimized `whisper-cli.exe` and multilingual
+base model to `%APPDATA%\JARVIS\voice`. If a local Windows bundle is present in
+the ignored repository `whisper\Release` and `whisper\models` folders, it uses
+that bundle; otherwise it builds the pinned official whisper.cpp v1.9.6 source.
+The source-build path requires CMake and Visual Studio Build Tools with the
+**Desktop development with C++** workload.
 
-1. Download a Windows release of `whisper-cli.exe` from
-   [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) and
-   place it in `%APPDATA%\JARVIS\voice`.
-2. Download the multilingual `ggml-small.bin` model from the
-   [whisper.cpp model repository](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true)
-   into the same folder.
-3. If you choose a different location or filename, set both `JARVIS_WHISPER_PATH`
-   and `JARVIS_WHISPER_MODEL` to their full paths in the root `.env`, then
-   restart JARVIS.
+```powershell
+Set-Location electron
+.\install-whisper.ps1
+```
+
+If PowerShell blocks the script, run it with a process-scoped policy override:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-whisper.ps1
+```
+
+The script is repeatable; use `.\install-whisper.ps1 -Force` to rebuild from
+source and redownload. It uses four CPU build workers and a four-thread transcription
+default to leave resources available for Ollama. Override the paths or thread
+count with `JARVIS_WHISPER_PATH`, `JARVIS_WHISPER_MODEL`, and
+`JARVIS_WHISPER_THREADS` in the repository-root `.env` file (see
+[`.env.example`](../.env.example)). The multilingual `ggml-base.bin` supports
+English and Hindi; Hinglish uses Whisper's automatic language detection. JARVIS
+speaks through Windows SAPI. Install a Hindi speech voice in Windows language
+settings if needed; set `JARVIS_SAPI_VOICE` to an exact voice name to pin one.
+
+Install Ollama and its smaller tool-capable model for a 16 GB RAM / 4 GB VRAM
+system:
+
+```powershell
+winget install --id Ollama.Ollama --exact
+ollama pull qwen2.5:3b
+```
+
+Ollama should be running locally at `http://127.0.0.1:11434`; if its tray
+application is not running, start it with `ollama serve`. Ollama chooses GPU
+offload based on available VRAM. Avoid loading other models concurrently when
+memory is constrained.
 
 Select English, Hindi, or Hinglish, grant microphone access, and leave listening
 enabled. Say **“Hey Jarvis”** or **“हे जार्विस”** to start a conversation
 session; natural follow-ups do not need another wake phrase. The session returns
-to standby after 45 seconds without speech. Say **“stop listening”** or
+to standby after 45 seconds without speech. JARVIS resumes listening after its
+spoken response unless listening is paused or the microphone is muted. Say
+**“stop listening”** or
 **“सुनना बंद करो”** to pause. The
 dashboard can be hidden while the tray and microphone remain active. JARVIS
 uses local voice activity detection and local Whisper transcription; it does
@@ -54,6 +77,9 @@ and model. Microphone and SAPI behavior still depends on Windows privacy
 settings and installed voices. While speaking, JARVIS stops playback after
 detecting 180 ms of sustained microphone speech (with browser echo cancellation
 enabled), allowing you to interrupt without waiting for transcription to finish.
+Natural-language answers stream into the dashboard; speech playback starts when
+the completed answer is available, so unverified partial tool responses are not
+spoken.
 
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.
@@ -81,7 +107,7 @@ resuming communication requires confirmation.
 ## AI conversation
 
 Natural-language requests and follow-up questions use Ollama by default. Install
-Ollama, download the configured tool-capable model such as `qwen2.5:7b`, and
+Ollama and download the configured tool-capable model `qwen2.5:3b`, then
 start the Ollama service. JARVIS connects to its OpenAI-compatible API at
 `http://127.0.0.1:11434/v1`.
 
@@ -126,6 +152,33 @@ lost if JARVIS exits or Windows restarts.
   speech output.
 - **Tray/startup unavailable:** login startup is supported on Windows; use the
   tray's **Start at login** option and verify Windows startup-app settings.
+
+## Automated and live voice tests
+
+Run the automated suites from the repository root:
+
+```powershell
+Set-Location electron
+npm test
+Set-Location ..\backend
+go test ./...
+```
+
+For a live test, make sure Whisper and Ollama are installed and running, then:
+
+```powershell
+Set-Location electron
+npm start
+```
+
+In JARVIS, grant microphone access, select English, and say **“Hey Jarvis, tell
+me a short greeting.”** Wait for the spoken reply, then ask a follow-up without
+the wake phrase. Repeat with Hindi and Hinglish selected. While a response is
+being spoken, begin speaking to test interruption; also test silence returning
+the assistant to standby, and pause/mute from the dashboard or tray. These
+device-dependent checks must be completed on the target Windows laptop; passing
+automated tests alone does not verify microphone, echo cancellation, SAPI voice,
+or real-time behavior.
 
 ## Permissions
 

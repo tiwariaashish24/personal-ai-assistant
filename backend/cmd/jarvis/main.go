@@ -85,9 +85,12 @@ type stdioRequest struct {
 	ClearConversation  bool   `json:"clearConversation,omitempty"`
 	Confirmed          bool   `json:"confirmed,omitempty"`
 	CancelConfirmation bool   `json:"cancelConfirmation,omitempty"`
+	Stream             bool   `json:"stream,omitempty"`
 }
 
 type stdioResponse struct {
+	Stream       bool   `json:"stream,omitempty"`
+	Delta        string `json:"delta,omitempty"`
 	Output       string `json:"output,omitempty"`
 	Exit         bool   `json:"exit,omitempty"`
 	Error        string `json:"error,omitempty"`
@@ -114,6 +117,16 @@ func runStdio(assistant *engine.Engine) error {
 			var err error
 			if request.Confirmed {
 				result, err = assistant.ExecuteConfirmed(request.Command)
+			} else if request.Stream {
+				result, err = assistant.ExecuteStreaming(request.Command, func(delta string) error {
+					if err := json.NewEncoder(writer).Encode(stdioResponse{Stream: true, Delta: delta}); err != nil {
+						return fmt.Errorf("encode streaming response: %w", err)
+					}
+					if err := writer.Flush(); err != nil {
+						return fmt.Errorf("write streaming response: %w", err)
+					}
+					return nil
+				})
 			} else {
 				result, err = assistant.Execute(request.Command)
 			}

@@ -32,6 +32,14 @@
     };
   }
 
+  function resolveConversationCommand(value, conversationActive) {
+    const wake = extractWakeCommand(value);
+    if (!conversationActive && !wake.activated) {
+      return null;
+    }
+    return wake.activated ? wake.command : String(value || "").trim();
+  }
+
   function resampleTo16k(input, inputRate) {
     if (!(input instanceof Float32Array) || inputRate <= 0) {
       throw new TypeError("audio samples and a positive sample rate are required");
@@ -230,6 +238,7 @@
     encodeWav,
     extractWakeCommand,
     normalizeSpeechText,
+    resolveConversationCommand,
     resemblesEcho,
     resampleTo16k,
   };

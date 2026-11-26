@@ -541,6 +541,10 @@ h1 {
   background: rgba(20, 29, 47, 0.85);
 }
 
+.message.streaming {
+  border-color: rgba(102, 228, 255, 0.22);
+}
+
 footer {
   display: flex;
   min-height: 54px;

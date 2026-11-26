@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -62,6 +64,7 @@ type chatCompletionRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 	Tools    []chatTool    `json:"tools"`
+	Stream   bool          `json:"stream,omitempty"`
 }
 
 type chatTool struct {
@@ -99,7 +102,7 @@ func newAIAssistant(cfg *config.Config) *aiAssistant {
 			baseURL = "http://127.0.0.1:11434/v1"
 		}
 		if model == "" {
-			model = "qwen2.5:7b"
+			model = "qwen2.5:3b"
 		}
 	case "openai":
 		if baseURL == "" {
@@ -129,6 +132,14 @@ func newAIAssistant(cfg *config.Config) *aiAssistant {
 }
 
 func (a *aiAssistant) respond(input string, execute func(string, json.RawMessage) (string, error)) (string, error) {
+	return a.respondStreaming(input, execute, nil)
+}
+
+func (a *aiAssistant) respondStreaming(
+	input string,
+	execute func(string, json.RawMessage) (string, error),
+	onDelta func(string) error,
+) (string, error) {
 	if a.configErr != nil {
 		return "", a.configErr
 	}
@@ -141,7 +152,13 @@ func (a *aiAssistant) respond(input string, execute func(string, json.RawMessage
 		}
 		messages = append(messages, turn...)
 
-		response, err := a.complete(messages)
+		var response chatMessage
+		var err error
+		if onDelta == nil {
+			response, err = a.complete(messages)
+		} else {
+			response, err = a.completeStreaming(messages, onDelta)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -183,6 +200,160 @@ func (a *aiAssistant) respond(input string, execute func(string, json.RawMessage
 		}
 	}
 	return "", errors.New("AI provider exceeded the tool-call limit")
+}
+
+type chatCompletionChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func (a *aiAssistant) completeStreaming(messages []chatMessage, onDelta func(string) error) (chatMessage, error) {
+	body, err := json.Marshal(chatCompletionRequest{
+		Model:    a.model,
+		Messages: messages,
+		Tools:    aiTools,
+		Stream:   true,
+	})
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("encode streaming AI request: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("create streaming AI request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	if a.apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return chatMessage{}, fmt.Errorf("contact AI provider: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxAIResponse+1))
+		if readErr != nil {
+			return chatMessage{}, fmt.Errorf("read AI error response: %w", readErr)
+		}
+		if len(responseBody) > maxAIResponse {
+			return chatMessage{}, errors.New("AI provider error response exceeded 1 MiB")
+		}
+		return chatMessage{}, fmt.Errorf("AI provider returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	var content strings.Builder
+	toolCalls := make(map[int]*chatToolCall)
+	var eventData strings.Builder
+	var responseBytes int64
+	finished := false
+	handleEvent := func() error {
+		payload := strings.TrimSpace(eventData.String())
+		eventData.Reset()
+		if payload == "" {
+			return nil
+		}
+		if payload == "[DONE]" {
+			finished = true
+			return nil
+		}
+		var chunk chatCompletionChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return fmt.Errorf("decode streaming AI response: %w", err)
+		}
+		if chunk.Error != nil {
+			return fmt.Errorf("AI provider error: %s", chunk.Error.Message)
+		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil {
+				finished = true
+			}
+			if choice.Delta.Content != "" {
+				content.WriteString(choice.Delta.Content)
+				if err := onDelta(choice.Delta.Content); err != nil {
+					return fmt.Errorf("forward AI response stream: %w", err)
+				}
+			}
+			for _, delta := range choice.Delta.ToolCalls {
+				call := toolCalls[delta.Index]
+				if call == nil {
+					call = &chatToolCall{Type: "function"}
+					toolCalls[delta.Index] = call
+				}
+				if delta.ID != "" {
+					call.ID = delta.ID
+				}
+				if delta.Type != "" {
+					call.Type = delta.Type
+				}
+				call.Function.Name += delta.Function.Name
+				call.Function.Arguments += delta.Function.Arguments
+			}
+		}
+		return nil
+	}
+
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64*1024), maxAIResponse)
+	for scanner.Scan() {
+		rawLine := scanner.Text()
+		responseBytes += int64(len(rawLine) + 1)
+		if responseBytes > maxAIResponse {
+			return chatMessage{}, errors.New("AI provider streaming response exceeded 1 MiB")
+		}
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "data:") {
+			eventData.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			eventData.WriteByte('\n')
+		} else if line == "" {
+			if err := handleEvent(); err != nil {
+				return chatMessage{}, err
+			}
+			if finished {
+				break
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return chatMessage{}, fmt.Errorf("read streaming AI response: %w", err)
+	}
+	if !finished {
+		if err := handleEvent(); err != nil {
+			return chatMessage{}, err
+		}
+	}
+	if !finished {
+		return chatMessage{}, errors.New("AI provider streaming response ended before completion")
+	}
+
+	indexes := make([]int, 0, len(toolCalls))
+	for index := range toolCalls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	result := chatMessage{Role: "assistant", Content: content.String()}
+	for _, index := range indexes {
+		result.ToolCalls = append(result.ToolCalls, *toolCalls[index])
+	}
+	return result, nil
 }
 
 func limitAIToolOutput(output string) string {

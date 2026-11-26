@@ -8,9 +8,11 @@ const maxAudioBytes = 512 * 1024;
 const maxOutputBytes = 64 * 1024;
 
 class VoiceRuntime {
-  constructor({ voiceDirectory, onState = () => {} }) {
+  constructor({ voiceDirectory, onState = () => {}, spawnProcess = spawn, platform = process.platform }) {
     this.voiceDirectory = voiceDirectory;
     this.onState = onState;
+    this.spawnProcess = spawnProcess;
+    this.platform = platform;
     this.environment = { ...process.env };
     this.speechProcess = null;
     this.speechPromise = null;
@@ -32,7 +34,7 @@ class VoiceRuntime {
         throw new Error(`Could not read voice configuration: ${error.message}`);
       }
       for (const line of contents.split(/\r?\n/)) {
-        const match = /^\s*(JARVIS_WHISPER_PATH|JARVIS_WHISPER_MODEL|JARVIS_SAPI_VOICE)\s*=\s*(.*?)\s*$/.exec(line);
+        const match = /^\s*(JARVIS_WHISPER_PATH|JARVIS_WHISPER_MODEL|JARVIS_WHISPER_THREADS|JARVIS_SAPI_VOICE)\s*=\s*(.*?)\s*$/.exec(line);
         if (!match || this.environment[match[1]]) {
           continue;
         }
@@ -43,13 +45,18 @@ class VoiceRuntime {
     this.binaryPath = this.environment.JARVIS_WHISPER_PATH ||
       path.join(this.voiceDirectory, process.platform === "win32" ? "whisper-cli.exe" : "whisper-cli");
     this.modelPath = this.environment.JARVIS_WHISPER_MODEL ||
-      path.join(this.voiceDirectory, "ggml-small.bin");
+      path.join(this.voiceDirectory, "ggml-base.bin");
+    const configuredThreads = this.environment.JARVIS_WHISPER_THREADS || "4";
+    if (!/^\d+$/.test(configuredThreads) || Number(configuredThreads) < 1 || Number(configuredThreads) > 16) {
+      throw new Error("JARVIS_WHISPER_THREADS must be an integer between 1 and 16.");
+    }
+    this.whisperThreads = Number(configuredThreads);
     this.sapiVoice = this.environment.JARVIS_SAPI_VOICE || "";
     await fs.mkdir(this.voiceDirectory, { recursive: true });
   }
 
   async availability() {
-    if (process.platform !== "win32") {
+    if (this.platform !== "win32") {
       return { available: false, message: "The configured offline voice runtime currently targets Windows." };
     }
     for (const filePath of [this.binaryPath, this.modelPath]) {
@@ -90,10 +97,11 @@ class VoiceRuntime {
 
   runWhisper(audioPath, language) {
     return new Promise((resolve, reject) => {
-      const child = spawn(this.binaryPath, [
+      const child = this.spawnProcess(this.binaryPath, [
         "-m", this.modelPath,
         "-f", audioPath,
         "-l", language,
+        "-t", String(this.whisperThreads),
         "-nt",
         "-np",
       ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -142,7 +150,7 @@ class VoiceRuntime {
   }
 
   speak(text) {
-    if (process.platform !== "win32") {
+    if (this.platform !== "win32") {
       return Promise.reject(new Error("Offline SAPI speech output is available on Windows only."));
     }
     const spokenText = String(text || "").trim();
@@ -184,7 +192,7 @@ class VoiceRuntime {
     this.onState("Speaking");
     this.speechPromise = new Promise((resolve, reject) => {
       let stderr = "";
-      const child = spawn(powershell, [
+      const child = this.spawnProcess(powershell, [
         "-NoLogo", "-NoProfile", "-NonInteractive",
         "-EncodedCommand", encodedScript,
       ], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });

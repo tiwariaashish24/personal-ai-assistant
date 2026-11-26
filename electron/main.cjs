@@ -248,21 +248,39 @@ function startAssistant() {
 
   const output = readline.createInterface({ input: child.stdout });
   output.on("line", (line) => {
-    const request = pendingRequests.shift();
+    const request = pendingRequests[0];
     if (!request) {
       console.error("Received an unexpected response from the assistant process.");
       return;
     }
 
+    let response;
     try {
-      const response = JSON.parse(line);
-      if (response.error) {
-        request.reject(new Error(response.error));
-      } else {
-        request.resolve(response);
-      }
+      response = JSON.parse(line);
     } catch (error) {
+      pendingRequests.shift();
       request.reject(new Error(`Invalid assistant response: ${error.message}`));
+      return;
+    }
+    if (response.stream === true) {
+      if (request.onStream && typeof response.delta === "string") {
+        try {
+          request.onStream(response.delta);
+        } catch (error) {
+          request.streamError = new Error(`Could not forward streaming response: ${error.message}`);
+          request.onStream = undefined;
+        }
+      }
+      return;
+    }
+    pendingRequests.shift();
+    if (request.streamError) {
+      setVoiceState("Error", request.streamError.message);
+      request.reject(request.streamError);
+    } else if (response.error) {
+      request.reject(new Error(response.error));
+    } else {
+      request.resolve(response);
     }
   });
 
@@ -294,10 +312,10 @@ function startAssistant() {
   return child;
 }
 
-function sendAssistantRequest(request) {
+function sendAssistantRequest(request, onStream) {
   const child = startAssistant();
   return new Promise((resolve, reject) => {
-    pendingRequests.push({ resolve, reject });
+    pendingRequests.push({ resolve, reject, onStream });
     child.stdin.write(`${JSON.stringify(request)}\n`, (error) => {
       if (!error) {
         return;
@@ -311,11 +329,21 @@ function sendAssistantRequest(request) {
   });
 }
 
-async function executeCommand(command) {
+async function executeCommand(command, stream = false) {
   if (typeof command !== "string" || command.trim() === "" || command.length > 4096) {
     throw new Error("Enter a command up to 4096 characters long.");
   }
-  const result = await sendAssistantRequest({ command });
+  if (typeof stream !== "boolean") {
+    throw new Error("The streaming option must be a boolean.");
+  }
+  const result = await sendAssistantRequest(
+    { command, stream },
+    stream ? (delta) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("jarvis:assistant-delta", { delta });
+      }
+    } : undefined,
+  );
   if (!result.confirmation) {
     return result;
   }
@@ -341,11 +369,11 @@ function isTrustedWindow(event) {
 }
 
 function registerIPC() {
-  ipcMain.handle("jarvis:execute", (event, command) => {
+  ipcMain.handle("jarvis:execute", (event, command, stream) => {
     if (!isTrustedWindow(event)) {
       throw new Error("Untrusted command request.");
     }
-    return executeCommand(command);
+    return executeCommand(command, stream);
   });
   ipcMain.handle("jarvis:clear-conversation", (event) => {
     if (!isTrustedWindow(event)) {

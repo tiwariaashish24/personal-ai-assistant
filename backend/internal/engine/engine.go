@@ -121,7 +121,11 @@ func New(workspace string) (*Engine, error) {
 }
 
 func (e *Engine) Execute(input string) (Result, error) {
-	return e.execute(input, false)
+	return e.executeWithStream(input, false, nil)
+}
+
+func (e *Engine) ExecuteStreaming(input string, onDelta func(string) error) (Result, error) {
+	return e.executeWithStream(input, false, onDelta)
 }
 
 func (e *Engine) ExecuteConfirmed(input string) (Result, error) {
@@ -156,6 +160,10 @@ func (e *Engine) Close() error {
 }
 
 func (e *Engine) execute(input string, confirmed bool) (Result, error) {
+	return e.executeWithStream(input, confirmed, nil)
+}
+
+func (e *Engine) executeWithStream(input string, confirmed bool, onDelta func(string) error) (Result, error) {
 	originalInput := input
 	input = normalizeHindiCommand(input)
 	fields, err := parseFields(input)
@@ -179,7 +187,7 @@ func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 		return Result{Output: "Goodbye.", Exit: true}, nil
 	case "open":
 		if len(fields) != 2 {
-			return e.respondToAI(originalInput)
+			return e.respondToAIStream(originalInput, onDelta)
 		}
 		app := strings.ToLower(fields[1])
 		if app != "chrome" && app != "vscode" && app != "notepad" {
@@ -199,22 +207,22 @@ func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 	case "create":
 		if len(fields) < 3 || (len(fields) > 3 && originalInput == input) ||
 			(len(fields) > 1 && (strings.EqualFold(fields[1], "a") || strings.EqualFold(fields[1], "an") || strings.EqualFold(fields[1], "the"))) {
-			return e.respondToAI(originalInput)
+			return e.respondToAIStream(originalInput, onDelta)
 		}
 		return e.create(fields[1], strings.Join(fields[2:], " "))
 	case "read":
 		if len(fields) != 2 {
-			return e.respondToAI(originalInput)
+			return e.respondToAIStream(originalInput, onDelta)
 		}
 		return e.read(fields[1])
 	case "append":
 		if len(fields) < 3 || (len(fields) > 3 && originalInput == input) {
-			return e.respondToAI(originalInput)
+			return e.respondToAIStream(originalInput, onDelta)
 		}
 		return e.append(fields[1], strings.Join(fields[2:], " "))
 	case "delete":
 		if len(fields) != 2 {
-			return e.respondToAI(originalInput)
+			return e.respondToAIStream(originalInput, onDelta)
 		}
 		return e.delete(fields[1], confirmed)
 	case "trash":
@@ -279,7 +287,7 @@ func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 		return e.managePermission(fields)
 	case "system":
 		if len(fields) != 1 {
-			return e.respondToAI(originalInput)
+			return e.respondToAIStream(originalInput, onDelta)
 		}
 		allowed, err := e.permissionAllowed("system_monitor", "*")
 		if err != nil {
@@ -296,7 +304,7 @@ func (e *Engine) execute(input string, confirmed bool) (Result, error) {
 		if e.ai == nil {
 			return Result{}, fmt.Errorf("%w: %s (type help for commands)", ErrUnknownCommand, fields[0])
 		}
-		return e.respondToAI(originalInput)
+		return e.respondToAIStream(originalInput, onDelta)
 	}
 }
 
@@ -560,12 +568,16 @@ func (e *Engine) managePermission(fields []string) (Result, error) {
 }
 
 func (e *Engine) respondToAI(input string) (Result, error) {
+	return e.respondToAIStream(input, nil)
+}
+
+func (e *Engine) respondToAIStream(input string, onDelta func(string) error) (Result, error) {
 	if e.ai == nil {
 		return Result{}, fmt.Errorf("%w: type help for commands", ErrUnknownCommand)
 	}
-	reply, err := e.ai.respond(input, func(name string, arguments json.RawMessage) (string, error) {
+	reply, err := e.ai.respondStreaming(input, func(name string, arguments json.RawMessage) (string, error) {
 		return e.runAITool(input, name, arguments)
-	})
+	}, onDelta)
 	if err != nil {
 		var confirmation *confirmationRequiredError
 		if errors.As(err, &confirmation) {

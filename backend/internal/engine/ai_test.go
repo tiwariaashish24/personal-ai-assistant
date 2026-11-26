@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,7 +10,112 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"jarvis/internal/config"
 )
+
+func TestDefaultOllamaModelIsSizedForLowMemoryDesktop(t *testing.T) {
+	assistant := newAIAssistant(&config.Config{})
+	if assistant.model != "qwen2.5:3b" {
+		t.Fatalf("default model = %q, want qwen2.5:3b", assistant.model)
+	}
+}
+
+func TestAIStreamingSendsIncrementalText(t *testing.T) {
+	assistant, _ := newTestEngine(t)
+	var streamEnabled bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		defer request.Body.Close()
+		var completion chatCompletionRequest
+		if err := json.NewDecoder(request.Body).Decode(&completion); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		streamEnabled = completion.Stream
+		writer.Header().Set("Content-Type", "text/event-stream")
+		flusher := writer.(http.Flusher)
+		_, _ = fmt.Fprint(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"}}]}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there.\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(writer, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+	assistant.ai = &aiAssistant{client: server.Client(), endpoint: server.URL + "/chat/completions", model: "test-model"}
+
+	var deltas []string
+	result, err := assistant.ExecuteStreaming("say hello", func(delta string) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !streamEnabled {
+		t.Fatal("AI provider request did not enable streaming")
+	}
+	if result.Output != "Hello there." {
+		t.Fatalf("reply = %q", result.Output)
+	}
+	if fmt.Sprint(deltas) != "[Hello  there.]" {
+		t.Fatalf("streamed deltas = %#v", deltas)
+	}
+}
+
+func TestAIStreamingReassemblesToolCallsBeforeFinalReply(t *testing.T) {
+	assistant, _ := newTestEngine(t)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		defer request.Body.Close()
+		requestCount++
+		writer.Header().Set("Content-Type", "text/event-stream")
+		flusher := writer.(http.Flusher)
+		if requestCount == 1 {
+			_, _ = fmt.Fprint(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n")
+			_, _ = fmt.Fprint(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"hello\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		} else {
+			_, _ = fmt.Fprint(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Found it.\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}
+		_, _ = fmt.Fprint(writer, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+	assistant.ai = &aiAssistant{client: server.Client(), endpoint: server.URL + "/chat/completions", model: "test-model"}
+
+	var deltas []string
+	reply, err := assistant.ai.respondStreaming("look something up", func(name string, arguments json.RawMessage) (string, error) {
+		if name != "lookup" || string(arguments) != `{"q":"hello"}` {
+			t.Errorf("tool call = %q %s", name, arguments)
+		}
+		return "lookup result", nil
+	}, func(delta string) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != "Found it." || requestCount != 2 {
+		t.Fatalf("reply = %q, provider requests = %d", reply, requestCount)
+	}
+	if fmt.Sprint(deltas) != "[Found it.]" {
+		t.Fatalf("streamed deltas included tool-call content: %#v", deltas)
+	}
+}
+
+func TestAIStreamingRejectsTruncatedProviderResponses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n")
+	}))
+	defer server.Close()
+	assistant := &aiAssistant{client: server.Client(), endpoint: server.URL + "/chat/completions", model: "test-model"}
+	_, err := assistant.completeStreaming(nil, func(string) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "ended before completion") {
+		t.Fatalf("truncated stream error = %v", err)
+	}
+}
 
 func TestNaturalLanguageUsesToolsAndRemembersConversation(t *testing.T) {
 	assistant, root := newTestEngine(t)

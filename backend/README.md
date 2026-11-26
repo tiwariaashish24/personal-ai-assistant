@@ -22,11 +22,16 @@ Some common Hindi commands are supported, including `क्रोम खोल�
 Run the engine tests with `go test ./...`.
 
 Natural-language requests are sent to Ollama by default using its
-OpenAI-compatible endpoint at `http://127.0.0.1:11434/v1`; install Ollama and a
-tool-capable model such as `qwen2.5:7b` to enable AI. To use OpenAI, set
+OpenAI-compatible endpoint at `http://127.0.0.1:11434/v1`; install Ollama and
+the tool-capable `qwen2.5:3b` model to enable AI. This smaller default is
+intended to leave memory and GPU headroom on 16 GB systems with 4 GB VRAM. To
+use OpenAI, set
 `JARVIS_AI_PROVIDER=openai` and `OPENAI_API_KEY`. Optional settings:
 `JARVIS_AI_BASE_URL` and `JARVIS_AI_MODEL`. These can be set as environment
-variables or in a `.env` file in the repository root or this directory.
+variables or in a `.env` file in the repository root or this directory. The
+Electron desktop streams assistant text from OpenAI-compatible providers when
+they support streaming responses; tool execution and confirmation checks remain
+in the Go engine.
 
 AI chat history is held in memory for the process lifetime and can be cleared
 through the desktop app. Function calls are restricted to the supported

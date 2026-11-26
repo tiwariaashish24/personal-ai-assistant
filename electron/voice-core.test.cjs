@@ -5,6 +5,7 @@ const {
   VoiceOnsetDetector,
   encodeWav,
   extractWakeCommand,
+  resolveConversationCommand,
   resemblesEcho,
   resampleTo16k,
 } = require("./voice-core.js");
@@ -20,6 +21,12 @@ test("wake phrase activates only on the explicit phrase and preserves its comman
   });
   assert.equal(extractWakeCommand("Jarvis, open my calendar").activated, false);
   assert.equal(extractWakeCommand("Open my calendar").activated, false);
+});
+
+test("conversation accepts follow-ups without a wake phrase only during an active session", () => {
+  assert.equal(resolveConversationCommand("What is next?", false), null);
+  assert.equal(resolveConversationCommand("Hey Jarvis, what is next?", false), "what is next?");
+  assert.equal(resolveConversationCommand("What is next?", true), "What is next?");
 });
 
 test("voice activity segmenter keeps pre-roll and ends after silence", () => {

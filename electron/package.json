@@ -6,6 +6,7 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
+    "install:whisper": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\install-whisper.ps1",
     "test": "node --test voice-core.test.cjs voice-runtime.test.cjs"
   },
   "devDependencies": {

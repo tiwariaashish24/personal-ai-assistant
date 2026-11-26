@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("jarvis", {
-  executeCommand: (command) => ipcRenderer.invoke("jarvis:execute", command),
+  executeCommand: (command, stream = false) => ipcRenderer.invoke("jarvis:execute", command, stream),
   clearConversation: () => ipcRenderer.invoke("jarvis:clear-conversation"),
   getIntegrations: () => ipcRenderer.invoke("jarvis:integrations"),
   getTasks: () => ipcRenderer.invoke("jarvis:tasks"),
@@ -17,6 +17,11 @@ contextBridge.exposeInMainWorld("jarvis", {
     const handler = (_event, action) => listener(action);
     ipcRenderer.on("jarvis:voice-action", handler);
     return () => ipcRenderer.removeListener("jarvis:voice-action", handler);
+  },
+  onAssistantDelta: (listener) => {
+    const handler = (_event, update) => listener(update);
+    ipcRenderer.on("jarvis:assistant-delta", handler);
+    return () => ipcRenderer.removeListener("jarvis:assistant-delta", handler);
   },
   onVoiceState: (listener) => {
     const handler = (_event, state) => listener(state);
