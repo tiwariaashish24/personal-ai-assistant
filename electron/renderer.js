@@ -76,7 +76,9 @@ const pipelineDiagnostics = {
   lastUtterance: "none",
   transcription: "idle",
   wakeWord: "waiting for Hey Jarvis",
+  session: "inactive; wake phrase required",
   backend: "not tested",
+  ai: "idle",
   speech: "idle",
   whisper: "not checked",
   diagnosticLog: "saved locally on errors",
@@ -96,7 +98,9 @@ function renderPipelineDiagnostics() {
     `Whisper: ${pipelineDiagnostics.whisper}`,
     `Transcription: ${pipelineDiagnostics.transcription}`,
     `Wake word: ${pipelineDiagnostics.wakeWord}`,
+    `Conversation: ${pipelineDiagnostics.session}`,
     `Go backend: ${pipelineDiagnostics.backend}`,
+    `AI assistant (Ollama): ${pipelineDiagnostics.ai}`,
     `Windows SAPI: ${pipelineDiagnostics.speech}`,
     `Persistent errors: ${pipelineDiagnostics.diagnosticLog}`,
   ].join("\n");
@@ -356,6 +360,7 @@ async function stopCapture(nextState = "Sleep", detail = "") {
   cancelPendingFrameCheck?.();
   cancelPendingFrameCheck = undefined;
   activeConversation = false;
+  updateSessionDiagnostic();
   window.clearTimeout(conversationTimer);
   if (audioNode) {
     audioNode.port.onmessage = null;
@@ -675,8 +680,16 @@ function spokenReply(command, reply) {
   return reply;
 }
 
+function updateSessionDiagnostic() {
+  const status = activeConversation
+    ? `active; follow-ups accepted (${processing ? "processing" : voiceState === "Speaking" ? "speaking" : "listening"})`
+    : "inactive; wake phrase required";
+  updatePipelineDiagnostic("session", status);
+}
+
 function refreshConversationSession() {
   activeConversation = true;
+  updateSessionDiagnostic();
   document.body.classList.add("is-awake");
   window.clearTimeout(conversationTimer);
   conversationTimer = window.setTimeout(() => {
@@ -685,6 +698,7 @@ function refreshConversationSession() {
       return;
     }
     activeConversation = false;
+    updateSessionDiagnostic();
     document.body.classList.remove("is-awake");
     if (listening) {
       setVoiceState("Standby");
@@ -720,7 +734,7 @@ function queueTranscription(samples, sampleRate) {
       );
       updatePipelineDiagnostic(
         "whisper",
-        `${voiceSettings?.whisperModel || "base"} model; ${sampleRate} Hz → 16000 Hz; ${wav.byteLength} byte WAV`,
+        `whisper-cli.exe running; ${voiceSettings?.whisperModel || "base"} model; ${sampleRate} Hz → 16000 Hz; ${wav.byteLength} byte WAV`,
       );
       updatePipelineDiagnostic("transcription", "transcribing offline with Whisper");
       const transcript = await window.jarvis.transcribeAudio(wav, transcriptionLanguage());
@@ -1044,8 +1058,15 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
   setVoiceState("Thinking", "Working on your request.");
   try {
     updatePipelineDiagnostic("backend", `${spoken ? "spoken" : "typed"} command sent to Go backend`);
+    updatePipelineDiagnostic("ai", "dispatched to Go backend; awaiting response");
     const result = await window.jarvis.executeCommand(trimmed, true);
     updatePipelineDiagnostic("backend", "Go backend responded successfully");
+    updatePipelineDiagnostic(
+      "ai",
+      latencyMetrics.firstAiTokenMs === null
+        ? "handled locally; no Ollama call needed"
+        : "Ollama response completed",
+    );
     const reply = result.output || "Done.";
     finishAssistantStream(reply);
     if (spoken) {
@@ -1056,6 +1077,7 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
     }
   } catch (error) {
     const interrupted = speechQueue?.cancelled === true;
+    updatePipelineDiagnostic("ai", interrupted ? "cancelled by user" : "request failed; see backend error");
     if (!pipelineDiagnostics.backend.includes("responded successfully")) {
       reportVoiceError("backend", error);
     }
@@ -1274,6 +1296,7 @@ window.jarvis.onAssistantDelta((update) => {
   appendAssistantDelta(delta);
   if (typeof delta === "string" && activeCommandStartedAt && latencyMetrics.firstAiTokenMs === null) {
     latencyMetrics.firstAiTokenMs = Date.now() - activeCommandStartedAt;
+    updatePipelineDiagnostic("ai", "Ollama streaming response received");
     renderLatencyMetrics();
   }
   if (typeof delta === "string" && activeSpeechQueue) {
