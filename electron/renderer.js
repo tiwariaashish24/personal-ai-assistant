@@ -671,6 +671,12 @@ async function startCapture() {
     } catch (error) {
       failed = true;
       window.clearTimeout(frameTimeout);
+      // #region agent log
+      agentDebugLog("A", "renderer.js:startCapture", "capture failed", {
+        failureStage,
+        error: error.message,
+      });
+      // #endregion
       await stopCapture("Error", `Could not start voice capture: ${error.message}`);
       reportVoiceError(failureStage, error);
     } finally {
