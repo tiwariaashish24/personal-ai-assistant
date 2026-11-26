@@ -424,20 +424,51 @@
   }
 
   function extractWakeCommand(value) {
-    const text = String(value || "").normalize("NFKC");
-    // Whisper's base model often drops "Hey" and writes Jarvis as Zavis.
-    const pattern = /(?:^|[\s,.!?।])(?:(?:hey|hi|okay|ok)\s+|(?:हे|है)\s*)?(?:jarvis|jervis|jarvice|javis|jarves|zavis|जार्विस)(?=$|[\s,.!?।])/iu;
+    const text = String(value || "").normalize("NFKC").trim();
+    // Only the opening words may carry the wake phrase; common Whisper mishearings are allowed.
+    const pattern = /^(?:(?:(?:hey|hi|okay|ok|here'?s|here\s+is|he'?s|he\s+is|हे|है)[\s,.:;!?।-]*)?(?:jarvis|jervis|jarvice|javis|jarves|jarwis|zavis|जार्विस)|(?:hey|here'?s|here\s+is)[\s,]+(?:our|are|a)\s+wis)(?=$|[\s,.!?।])/iu;
     const match = pattern.exec(text);
-    if (!match) {
+    const wakeEnd = match ? match.index + match[0].length : fuzzyWakeEnd(text);
+    if (wakeEnd < 0) {
       return { activated: false, command: "" };
     }
     return {
       activated: true,
-      command: text.slice(match.index + match[0].length)
+      command: text.slice(wakeEnd)
         .replace(/^[\s,.:;!?।-]+/, "")
         .replace(/[.।]+$/u, "")
         .trim(),
     };
+  }
+
+  function editDistance(a, b) {
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= a.length; i += 1) {
+      const current = [i];
+      for (let j = 1; j <= b.length; j += 1) {
+        current[j] = Math.min(
+          previous[j] + 1,
+          current[j - 1] + 1,
+          previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+        );
+      }
+      previous = current;
+    }
+    return previous[b.length];
+  }
+
+  // Whisper's base model spells "Jarvis" many ways (Arvis, Travis, Jarvas); accept a
+  // close match only as the first or second word so names mid-sentence never wake it.
+  function fuzzyWakeEnd(text) {
+    const wordPattern = /[\p{L}']+/gu;
+    let word;
+    for (let index = 0; index < 2 && (word = wordPattern.exec(text)); index += 1) {
+      const letters = word[0].toLocaleLowerCase().replace(/'/g, "");
+      if (letters.length >= 4 && letters.length <= 8 && editDistance(letters, "jarvis") <= 2) {
+        return word.index + word[0].length;
+      }
+    }
+    return -1;
   }
 
   function resolveConversationCommand(value, conversationActive) {

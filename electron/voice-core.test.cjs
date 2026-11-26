@@ -32,22 +32,47 @@ test("wake phrase activates only on the explicit phrase and preserves its comman
     activated: true,
     command: "कैलेंडर खोलो",
   });
-  assert.deepEqual(extractWakeCommand("Jarvis, open my calendar"), {
+  assert.deepEqual(extractWakeCommand("Hey Zavis, open chrome."), {
     activated: true,
-    command: "open my calendar",
-  });
-  assert.deepEqual(extractWakeCommand("Zavis Open Chrome."), {
-    activated: true,
-    command: "Open Chrome",
-  });
-  assert.deepEqual(extractWakeCommand("Here is Jarvis Open Chrome."), {
-    activated: true,
-    command: "Open Chrome",
+    command: "open chrome",
   });
   assert.deepEqual(extractWakeCommand("Hi Jarvis."), {
     activated: true,
     command: "",
   });
+  assert.deepEqual(extractWakeCommand("Jarvis, open my calendar"), {
+    activated: true,
+    command: "open my calendar",
+  });
+  assert.deepEqual(extractWakeCommand("Here is Jarvis Open Chrome."), {
+    activated: true,
+    command: "Open Chrome",
+  });
+  assert.deepEqual(extractWakeCommand("He's Jarvis, open YouTube."), {
+    activated: true,
+    command: "open YouTube",
+  });
+  assert.deepEqual(extractWakeCommand("Here's our WIS Open Chrome."), {
+    activated: true,
+    command: "Open Chrome",
+  });
+  assert.deepEqual(extractWakeCommand("Please Arvis open chrome."), {
+    activated: true,
+    command: "open chrome",
+  });
+  assert.equal(extractWakeCommand("I told Jarvis to open chrome.").activated, false);
+  for (const ignored of [
+    "What are you doing?",
+    "I think it will be a good idea to do something.",
+    "Have a nice day.",
+    "Thanks for being here.",
+    "This is what we are going to do. We will do it.",
+    "Can you name a hotel at base?",
+  ]) {
+    assert.equal(extractWakeCommand(ignored).activated, false, ignored);
+  }
+  assert.equal(extractWakeCommand("My thing point is, Jarpoint didn't give you the answer.").activated, false);
+  assert.equal(extractWakeCommand("He is always open chrome and then YouTube.").activated, false);
   assert.equal(extractWakeCommand("Open my calendar").activated, false);
   assert.equal(extractWakeCommand("These are with open chrome.").activated, false);
 });
