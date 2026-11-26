@@ -1,4 +1,14 @@
 const voiceCore = window.JarvisVoiceCore;
+
+// #region agent log
+function agentDebugLog(hypothesisId, location, message, data) {
+  fetch("http://127.0.0.1:7298/ingest/5c6b63f7-1d20-47e6-a655-0bc59455c0ef", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "a054d2" },
+    body: JSON.stringify({ sessionId: "a054d2", runId: "pre-fix", hypothesisId, location, message, data, timestamp: Date.now() }),
+  }).catch(() => {});
+}
+// #endregion
 const microphoneButton = document.querySelector("#microphone-button");
 const microphoneLabel = document.querySelector("#microphone-label");
 const muteButton = document.querySelector("#mute-button");
@@ -424,10 +434,23 @@ async function startCapture() {
     return captureStartPromise;
   }
   if (muted || !voiceSettings?.listeningEnabled) {
+    // #region agent log
+    agentDebugLog("E", "renderer.js:startCapture", "capture blocked before microphone start", {
+      muted,
+      listeningEnabled: Boolean(voiceSettings?.listeningEnabled),
+      voiceState,
+    });
+    // #endregion
     await stopCapture("Sleep", muted ? "Microphone is muted." : "Listening is paused.");
     return;
   }
   if (!voiceSettings?.runtime?.available) {
+    // #region agent log
+    agentDebugLog("B", "renderer.js:startCapture", "offline voice runtime unavailable", {
+      message: voiceSettings?.runtime?.message || "",
+      whisperModel: voiceSettings?.whisperModel || "",
+    });
+    // #endregion
     updatePipelineDiagnostic("whisper", voiceSettings?.runtime?.message || "Offline runtime unavailable");
     await stopCapture("Offline", voiceSettings?.runtime?.message || "Configure offline voice recognition.");
     return;
@@ -601,7 +624,18 @@ async function startCapture() {
         if (utterance) {
           const durationSeconds = utterance.length / context.sampleRate;
           updatePipelineDiagnostic("lastUtterance", `${durationSeconds.toFixed(2)} seconds`);
-          if (voiceCore.isSpeechLikeAudio(utterance, context.sampleRate)) {
+          const speechLike = voiceCore.isSpeechLikeAudio(utterance, context.sampleRate);
+          // #region agent log
+          agentDebugLog("A", "renderer.js:audioFrame", speechLike ? "utterance accepted" : "utterance rejected", {
+            durationSeconds: Number(durationSeconds.toFixed(2)),
+            sampleRate: context.sampleRate,
+            voiceState,
+            processing,
+            listening,
+            activeConversation,
+          });
+          // #endregion
+          if (speechLike) {
             updatePipelineDiagnostic("vad", "utterance accepted; sending to Whisper");
             queueTranscription(utterance, context.sampleRate);
           } else {
@@ -717,6 +751,13 @@ function isPausePhrase(text) {
 function queueTranscription(samples, sampleRate) {
   transcriptionQueue = transcriptionQueue.then(async () => {
     if (!listening) {
+      // #region agent log
+      agentDebugLog("E", "renderer.js:queueTranscription", "transcription skipped because listening is off", {
+        voiceState,
+        processing,
+        activeConversation,
+      });
+      // #endregion
       return;
     }
     let failed = false;
@@ -745,7 +786,18 @@ function queueTranscription(samples, sampleRate) {
         "transcription",
         transcript ? `transcript received in ${latencyMetrics.transcriptionMs} ms` : "Whisper returned no text",
       );
-      if (!voiceCore.isValidTranscript(transcript)) {
+      const transcriptValid = voiceCore.isValidTranscript(transcript);
+      // #region agent log
+      agentDebugLog("B", "renderer.js:queueTranscription", "transcript received", {
+        valid: transcriptValid,
+        transcriptPreview: String(transcript || "").slice(0, 120),
+        elapsedMs: Date.now() - transcriptionStartedAt,
+        voiceState,
+        processing,
+        activeConversation,
+      });
+      // #endregion
+      if (!transcriptValid) {
         updatePipelineDiagnostic("wakeWord", "transcript rejected as empty, invalid, or hallucinated");
         return;
       }
@@ -786,10 +838,25 @@ async function handleTranscript(transcript) {
   const preservedTranscript = String(transcript || "");
   const safeTranscript = voiceCore.sanitizeTranscript(preservedTranscript);
   if (!listening || !safeTranscript) {
+    // #region agent log
+    agentDebugLog("E", "renderer.js:handleTranscript", "transcript dropped before command parsing", {
+      listening,
+      hasTranscript: Boolean(safeTranscript),
+      voiceState,
+      processing,
+    });
+    // #endregion
     return false;
   }
   const mayBeEcho = voiceState === "Speaking" || Date.now() < spokenEchoWindowUntil;
   if (mayBeEcho && voiceCore.resemblesEcho(safeTranscript, currentSpokenText)) {
+    // #region agent log
+    agentDebugLog("E", "renderer.js:handleTranscript", "transcript rejected as echo", {
+      voiceState,
+      activeConversation,
+      transcriptPreview: safeTranscript.slice(0, 120),
+    });
+    // #endregion
     return false;
   }
   if (voiceState === "Speaking") {
@@ -803,6 +870,16 @@ async function handleTranscript(transcript) {
   );
   const resolvedCommand = voiceCore.resolveConversationCommand(safeTranscript, activeConversation);
   const command = resolvedCommand === null ? null : voiceCore.normalizeCommand(resolvedCommand);
+  // #region agent log
+  agentDebugLog("C", "renderer.js:handleTranscript", "wake and command decision", {
+    wakeActivated: wake.activated,
+    hadActiveConversation,
+    commandPreview: command === null ? null : String(command).slice(0, 120),
+    transcriptPreview: safeTranscript.slice(0, 120),
+    voiceState,
+    listening,
+  });
+  // #endregion
   if (command === null) {
     return false;
   }
@@ -1052,6 +1129,15 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
   }) : undefined;
   activeSpeechQueue = speechQueue;
   processing = true;
+  // #region agent log
+  agentDebugLog("D", "renderer.js:executeCommand", "spoken or typed command started", {
+    spoken,
+    commandPreview: trimmed.slice(0, 120),
+    listening,
+    voiceState,
+    activeConversation,
+  });
+  // #endregion
   discardAssistantStream();
   document.body.classList.remove("is-awake");
   addMessage("user", originalTranscript || trimmed);
@@ -1068,6 +1154,13 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
         : "Ollama response completed",
     );
     const reply = result.output || "Done.";
+    // #region agent log
+    agentDebugLog("D", "renderer.js:executeCommand", "command completed", {
+      replyPreview: String(reply).slice(0, 160),
+      spoken,
+      voiceState,
+    });
+    // #endregion
     finishAssistantStream(reply);
     if (spoken) {
       if (speechQueue && !speechQueue.hasContent && !speechQueue.cancelled) {
@@ -1076,6 +1169,14 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
       await speechQueue?.finish();
     }
   } catch (error) {
+    // #region agent log
+    agentDebugLog("D", "renderer.js:executeCommand", "command failed in renderer", {
+      error: error.message,
+      voiceState,
+      listening,
+      activeConversation,
+    });
+    // #endregion
     const interrupted = speechQueue?.cancelled === true;
     updatePipelineDiagnostic("ai", interrupted ? "cancelled by user" : "request failed; see backend error");
     if (!pipelineDiagnostics.backend.includes("responded successfully")) {

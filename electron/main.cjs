@@ -7,6 +7,18 @@ const path = require("node:path");
 const { VoiceRuntime } = require("./voice-runtime.cjs");
 const voiceCore = require("./voice-core.js");
 const { appendVoiceDiagnostic } = require("./voice-diagnostics.cjs");
+const fsSync = require("node:fs");
+
+// #region agent log
+function agentDebugLog(hypothesisId, location, message, data) {
+  try {
+    fsSync.appendFileSync(
+      "e:\\USER\\OneDrive\\Desktop\\assistend\\.cursor\\debug-a054d2.log",
+      `${JSON.stringify({ sessionId: "a054d2", runId: "pre-fix", hypothesisId, location, message, data, timestamp: Date.now() })}\n`,
+    );
+  } catch {}
+}
+// #endregion
 
 const backendDirectory = path.resolve(__dirname, "..", "backend");
 let mainWindow;
@@ -213,13 +225,31 @@ function checkTrustedWindow(event) {
 
 async function transcribeAudio(event, audio, language) {
   checkTrustedWindow(event);
+  // #region agent log
+  agentDebugLog("B", "main.cjs:transcribeAudio", "transcription started", {
+    language,
+    audioBytes: audio?.byteLength || audio?.length || 0,
+    model: voiceRuntime?.selectedModel || "",
+    modelPathExists: Boolean(voiceRuntime?.modelPath) && fsSync.existsSync(voiceRuntime.modelPath),
+    binaryExists: Boolean(voiceRuntime?.binaryPath) && fsSync.existsSync(voiceRuntime.binaryPath),
+  });
+  // #endregion
   try {
     const transcript = await voiceRuntime.transcribe(audio, language);
+    // #region agent log
+    agentDebugLog("B", "main.cjs:transcribeAudio", "transcription finished", {
+      transcriptChars: typeof transcript === "string" ? transcript.length : 0,
+      transcriptPreview: typeof transcript === "string" ? transcript.slice(0, 120) : "",
+    });
+    // #endregion
     if (!transcript) {
       return "";
     }
     return transcript;
   } catch (error) {
+    // #region agent log
+    agentDebugLog("B", "main.cjs:transcribeAudio", "transcription failed", { error: error.message });
+    // #endregion
     setVoiceState("Error", error.message);
     throw error;
   }
@@ -363,20 +393,44 @@ function sendAssistantRequest(request, onStream) {
 }
 
 async function executeCommand(command, stream = false) {
+  // #region agent log
+  agentDebugLog("D", "main.cjs:executeCommand", "backend command started", {
+    commandPreview: typeof command === "string" ? command.slice(0, 120) : "",
+    stream,
+    assistantRunning: Boolean(assistantProcess),
+    pendingRequests: pendingRequests.length,
+  });
+  // #endregion
   if (typeof command !== "string" || command.trim() === "" || command.length > 4096) {
     throw new Error("Enter a command up to 4096 characters long.");
   }
   if (typeof stream !== "boolean") {
     throw new Error("The streaming option must be a boolean.");
   }
-  const result = await sendAssistantRequest(
-    { command, stream },
-    stream ? (delta) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send("jarvis:assistant-delta", { delta });
-      }
-    } : undefined,
-  );
+  let result;
+  try {
+    result = await sendAssistantRequest(
+      { command, stream },
+      stream ? (delta) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("jarvis:assistant-delta", { delta });
+        }
+      } : undefined,
+    );
+  } catch (error) {
+    // #region agent log
+    agentDebugLog("D", "main.cjs:executeCommand", "backend command failed", { error: error.message });
+    // #endregion
+    throw error;
+  }
+  // #region agent log
+  agentDebugLog("D", "main.cjs:executeCommand", "backend command returned", {
+    hasOutput: Boolean(result?.output),
+    outputPreview: typeof result?.output === "string" ? result.output.slice(0, 160) : "",
+    needsConfirmation: Boolean(result?.confirmation),
+    hasError: Boolean(result?.error),
+  });
+  // #endregion
   if (!result.confirmation) {
     return result;
   }
@@ -689,6 +743,18 @@ if (singleInstanceLock) {
       voicePreferences.whisperModel = voiceRuntime.selectedModel;
     }
     voiceAvailability = await voiceRuntime.availability();
+    // #region agent log
+    agentDebugLog("B", "main.cjs:startup", "voice runtime availability", {
+      available: voiceAvailability.available,
+      message: voiceAvailability.message,
+      binaryPath: voiceRuntime.binaryPath,
+      modelPath: voiceRuntime.modelPath,
+      binaryExists: fsSync.existsSync(voiceRuntime.binaryPath),
+      modelExists: fsSync.existsSync(voiceRuntime.modelPath),
+      listeningEnabled: voicePreferences.listeningEnabled,
+      muted: voicePreferences.muted,
+    });
+    // #endregion
     if (!voiceAvailability.available) {
       setVoiceState("Offline", voiceAvailability.message);
     }
