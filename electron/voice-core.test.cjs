@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   VoiceActivitySegmenter,
+  VoiceOnsetDetector,
   encodeWav,
   extractWakeCommand,
   resemblesEcho,
@@ -36,6 +37,20 @@ test("voice activity segmenter keeps pre-roll and ends after silence", () => {
   assert.equal(utterance.length, 400);
   assert.equal(utterance[0], 0);
   assert.ok(Math.abs(utterance[100] - 0.1) < 1e-6);
+});
+
+test("voice onset detector requires sustained speech and resets on silence", () => {
+  const detector = new VoiceOnsetDetector({
+    sampleRate: 1000,
+    threshold: 0.05,
+    minimumMs: 100,
+  });
+  const speech = new Float32Array(50).fill(0.1);
+  assert.equal(detector.push(speech), false);
+  assert.equal(detector.push(speech), true);
+  assert.equal(detector.push(speech), false);
+  assert.equal(detector.push(new Float32Array(20)), false);
+  assert.equal(detector.push(speech), false);
 });
 
 test("voice WAV encoding produces mono 16-bit PCM", () => {

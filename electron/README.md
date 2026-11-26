@@ -51,7 +51,9 @@ not use Chromium's online speech recognition. Audio segments are held in memory
 and transient WAV files are removed after transcription; raw recordings are not
 retained by default. Offline transcription requires the configured executable
 and model. Microphone and SAPI behavior still depends on Windows privacy
-settings and installed voices.
+settings and installed voices. While speaking, JARVIS stops playback after
+detecting 180 ms of sustained microphone speech (with browser echo cancellation
+enabled), allowing you to interrupt without waiting for transcription to finish.
 
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.

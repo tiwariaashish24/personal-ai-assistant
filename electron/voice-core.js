@@ -168,6 +168,43 @@
     }
   }
 
+  class VoiceOnsetDetector {
+    constructor(options = {}) {
+      this.sampleRate = options.sampleRate || TARGET_SAMPLE_RATE;
+      this.threshold = options.threshold || 0.025;
+      this.minimumSamples = Math.floor(this.sampleRate * (options.minimumMs || 180) / 1000);
+      this.reset();
+    }
+
+    reset() {
+      this.voicedSamples = 0;
+      this.triggered = false;
+    }
+
+    push(samples) {
+      if (!(samples instanceof Float32Array)) {
+        throw new TypeError("voice onset input must be Float32Array");
+      }
+      if (samples.length === 0) {
+        return false;
+      }
+      let sum = 0;
+      for (const sample of samples) {
+        sum += sample * sample;
+      }
+      if (Math.sqrt(sum / samples.length) < this.threshold) {
+        this.reset();
+        return false;
+      }
+      this.voicedSamples += samples.length;
+      if (!this.triggered && this.voicedSamples >= this.minimumSamples) {
+        this.triggered = true;
+        return true;
+      }
+      return false;
+    }
+  }
+
   function resemblesEcho(transcript, spokenText) {
     const heard = normalizeSpeechText(transcript);
     const spoken = normalizeSpeechText(spokenText);
@@ -188,6 +225,7 @@
 
   return {
     TARGET_SAMPLE_RATE,
+    VoiceOnsetDetector,
     VoiceActivitySegmenter,
     encodeWav,
     extractWakeCommand,

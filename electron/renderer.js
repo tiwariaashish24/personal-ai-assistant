@@ -25,6 +25,8 @@ let audioContext;
 let audioNode;
 let audioSource;
 let segmenter;
+let bargeInDetector;
+let bargeInRequested = false;
 let processing = false;
 let transcriptionQueue = Promise.resolve();
 let commandQueue = Promise.resolve();
@@ -75,6 +77,8 @@ async function speak(text) {
   if (!text) {
     return;
   }
+  bargeInDetector?.reset();
+  bargeInRequested = false;
   currentSpokenText = text;
   spokenEchoWindowUntil = Number.POSITIVE_INFINITY;
   setVoiceState("Speaking");
@@ -126,6 +130,8 @@ async function stopCapture(nextState = "Sleep", detail = "") {
     audioContext = undefined;
     await context.close();
   }
+  bargeInDetector = undefined;
+  bargeInRequested = false;
   document.body.classList.remove("is-listening", "is-awake");
   updateMicrophoneButtons();
   setVoiceState(nextState, detail);
@@ -180,9 +186,24 @@ async function startCapture() {
       const mutedOutput = audioContext.createGain();
       mutedOutput.gain.value = 0;
       segmenter = new voiceCore.VoiceActivitySegmenter({ sampleRate: audioContext.sampleRate });
+      bargeInDetector = new voiceCore.VoiceOnsetDetector({
+        sampleRate: voiceCore.TARGET_SAMPLE_RATE,
+        minimumMs: 180,
+      });
       audioNode.port.onmessage = ({ data }) => {
         const input = data instanceof Float32Array ? data : new Float32Array(data);
         const samples = voiceCore.resampleTo16k(input, audioContext.sampleRate);
+        if (voiceState === "Speaking") {
+          if (!bargeInRequested && bargeInDetector.push(samples)) {
+            bargeInRequested = true;
+            void window.jarvis.interruptSpeech().catch((error) => {
+              setVoiceState("Error", `Could not interrupt speech: ${error.message}`);
+            });
+          }
+        } else {
+          bargeInDetector.reset();
+          bargeInRequested = false;
+        }
         const utterance = segmenter.push(samples);
         if (utterance) {
           queueTranscription(utterance);
