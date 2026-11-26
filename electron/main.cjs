@@ -790,6 +790,7 @@ if (singleInstanceLock) {
     const voiceDirectory = path.join(app.getPath("userData"), "voice");
     voiceRuntime = new VoiceRuntime({
       voiceDirectory,
+      keepModelLoaded: true,
       onState: (state) => {
         const nextState = state === "Speaking"
           ? state
@@ -821,6 +822,7 @@ if (singleInstanceLock) {
     } else {
       voicePreferences.whisperModel = voiceRuntime.selectedModel;
     }
+    void voiceRuntime.prewarmWhisper();
     voiceAvailability = await voiceRuntime.availability();
     // #region agent log
     agentDebugLog("B", "main.cjs:startup", "voice runtime availability", {

@@ -562,6 +562,7 @@ async function startCapture() {
       mutedOutput.gain.value = 0;
       segmenter = new voiceCore.VoiceActivitySegmenter({
         sampleRate: context.sampleRate,
+        silenceMs: 400,
         maximumMs: 30000,
       });
       bargeInDetector = new voiceCore.VoiceOnsetDetector({
@@ -732,14 +733,35 @@ function refreshConversationSession() {
   updateSessionDiagnostic();
   document.body.classList.add("is-awake");
   window.clearTimeout(conversationTimer);
+  // #region agent log
+  agentDebugLog("A", "renderer.js:refreshConversationSession", "conversation session armed", {
+    timeoutMs: 45000,
+    processing,
+    voiceState,
+    listening,
+  });
+  // #endregion
   conversationTimer = window.setTimeout(() => {
     if (processing || voiceState === "Speaking") {
+      // #region agent log
+      agentDebugLog("B", "renderer.js:refreshConversationSession", "session timer re-armed instead of ending", {
+        processing,
+        voiceState,
+        listening,
+      });
+      // #endregion
       refreshConversationSession();
       return;
     }
     activeConversation = false;
     updateSessionDiagnostic();
     document.body.classList.remove("is-awake");
+    // #region agent log
+    agentDebugLog("A", "renderer.js:refreshConversationSession", "conversation session ended", {
+      listening,
+      voiceState,
+    });
+    // #endregion
     if (listening) {
       setVoiceState("Standby");
     }
@@ -888,6 +910,14 @@ async function handleTranscript(transcript) {
   // #endregion
   if (command === null) {
     return false;
+  }
+  if (processing && !wake.activated) {
+    // #region agent log
+    agentDebugLog("D", "renderer.js:handleTranscript", "follow-up skipped while a command is still running", {
+      commandPreview: String(command).slice(0, 120),
+    });
+    // #endregion
+    return true;
   }
   if (isPausePhrase(command || safeTranscript)) {
     await window.jarvis.setVoiceControl("pause");
@@ -1208,6 +1238,13 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
     }
     activeCommandStartedAt = 0;
     if (listening && activeConversation) {
+      // #region agent log
+      agentDebugLog("C", "renderer.js:executeCommand", "session refreshed after command finished", {
+        listening,
+        voiceState,
+        activeConversation,
+      });
+      // #endregion
       refreshConversationSession();
     }
     if (listening && voiceState !== "Speaking" && voiceState !== "Error") {

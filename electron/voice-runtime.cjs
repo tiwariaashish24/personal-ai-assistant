@@ -1,6 +1,8 @@
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
+const http = require("node:http");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 
@@ -39,11 +41,14 @@ function isMonoPcm16kWav(audio) {
 }
 
 class VoiceRuntime {
-  constructor({ voiceDirectory, onState = () => {}, spawnProcess = spawn, platform = process.platform }) {
+  constructor({ voiceDirectory, onState = () => {}, spawnProcess = spawn, platform = process.platform, keepModelLoaded = false }) {
     this.voiceDirectory = voiceDirectory;
     this.onState = onState;
     this.spawnProcess = spawnProcess;
     this.platform = platform;
+    this.keepModelLoaded = keepModelLoaded;
+    this.whisperServer = null;
+    this.whisperServerStart = null;
     this.environment = { ...process.env };
     this.speechProcess = null;
     this.speechQueue = [];
@@ -193,10 +198,117 @@ class VoiceRuntime {
     const audioPath = path.join(scratchDirectory, `${crypto.randomUUID()}.wav`);
     try {
       await fs.writeFile(audioPath, audio, { flag: "wx", mode: 0o600 });
+      if (this.keepModelLoaded) {
+        try {
+          return await this.transcribeWithServer(audioPath, language);
+        } catch (error) {
+          // #region agent log
+          try { require("node:fs").appendFileSync("e:\\USER\\OneDrive\\Desktop\\assistend\\.cursor\\debug-a054d2.log", `${JSON.stringify({ sessionId: "a054d2", runId: "pre-fix", hypothesisId: "B", location: "voice-runtime.cjs:transcribe", message: "warm whisper failed, using one-shot", data: { error: error.message }, timestamp: Date.now() })}\n`); } catch {}
+          // #endregion
+        }
+      }
       return await this.runWhisper(audioPath, language);
     } finally {
       await fs.rm(scratchDirectory, { recursive: true, force: true });
     }
+  }
+
+  whisperServerBinary() {
+    return path.join(path.dirname(this.binaryPath), this.platform === "win32" ? "whisper-server.exe" : "whisper-server");
+  }
+
+  prewarmWhisper() {
+    if (!this.keepModelLoaded) {
+      return Promise.resolve();
+    }
+    return this.ensureWhisperServer().catch(() => {});
+  }
+
+  async ensureWhisperServer() {
+    if (this.whisperServer && this.whisperServer.modelPath === this.modelPath &&
+        this.whisperServer.child.exitCode === null && !this.whisperServer.child.killed) {
+      return this.whisperServer;
+    }
+    if (this.whisperServerStart) {
+      return this.whisperServerStart;
+    }
+    this.whisperServerStart = this.startWhisperServer().finally(() => {
+      this.whisperServerStart = null;
+    });
+    return this.whisperServerStart;
+  }
+
+  async startWhisperServer() {
+    await this.stopWhisperServer();
+    const serverBinary = this.whisperServerBinary();
+    await fs.access(serverBinary);
+    const port = 18766;
+    const child = this.spawnProcess(serverBinary, [
+      "-m", this.modelPath,
+      "-l", "en",
+      "-t", String(this.whisperThreads || 4),
+      "-nt",
+      "-sns",
+      "-nth", this.noSpeechThreshold || "0.6",
+      "-bs", "1",
+      "-bo", "1",
+      "-nf",
+      "-nc",
+      "--host", "127.0.0.1",
+      "--port", String(port),
+    ], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+    const server = { child, port, modelPath: this.modelPath };
+    this.whisperServer = server;
+    child.once("exit", () => {
+      if (this.whisperServer === server) {
+        this.whisperServer = null;
+      }
+    });
+    try {
+      await waitForPort(port, 20000);
+    } catch (error) {
+      child.kill();
+      if (this.whisperServer === server) {
+        this.whisperServer = null;
+      }
+      throw error;
+    }
+    return server;
+  }
+
+  async stopWhisperServer() {
+    const server = this.whisperServer;
+    this.whisperServer = null;
+    if (!server) {
+      return;
+    }
+    server.child.kill();
+  }
+
+  async transcribeWithServer(audioPath, language) {
+    const startedAt = Date.now();
+    const server = await this.ensureWhisperServer();
+    const audio = await fs.readFile(audioPath);
+    const prompt = language === "hi" ? "हे जार्विस।" : "Hey Jarvis.";
+    const spokenLanguage = language === "auto" ? "en" : language;
+    const body = multipartBody([
+      ["response_format", "json"],
+      ["temperature", "0"],
+      ["language", spokenLanguage],
+      ["prompt", prompt],
+    ], audio);
+    const responseText = await httpPost(
+      server.port,
+      "/inference",
+      `multipart/form-data; boundary=${body.boundary}`,
+      body.payload,
+    );
+    const parsed = JSON.parse(responseText);
+    const transcript = String(parsed.text || "").replace(/\s+/g, " ").trim();
+    // #region agent log
+    try { require("node:fs").appendFileSync("e:\\USER\\OneDrive\\Desktop\\assistend\\.cursor\\debug-a054d2.log", `${JSON.stringify({ sessionId: "a054d2", runId: "pre-fix", hypothesisId: "B", location: "voice-runtime.cjs:transcribeWithServer", message: "warm whisper finished", data: { elapsedMs: Date.now() - startedAt, transcriptChars: transcript.length }, timestamp: Date.now() })}\n`); } catch {}
+    // #endregion
+    return transcript;
   }
 
   runWhisper(audioPath, language) {
@@ -214,6 +326,9 @@ class VoiceRuntime {
         "-nt",
         "-np",
         "--prompt", language === "hi" ? "हे जार्विस।" : "Hey Jarvis.",
+        "-bs", "1",
+        "-bo", "1",
+        "-nf",
       ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
@@ -440,7 +555,77 @@ class VoiceRuntime {
 
   close() {
     this.interrupt();
+    void this.stopWhisperServer();
   }
+}
+
+function waitForPort(port, timeoutMs) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const socket = net.connect(port, "127.0.0.1");
+      socket.once("connect", () => {
+        socket.end();
+        resolve();
+      });
+      socket.once("error", () => {
+        socket.destroy();
+        if (Date.now() - startedAt > timeoutMs) {
+          reject(new Error("The Whisper server did not open its port in time."));
+          return;
+        }
+        setTimeout(attempt, 100);
+      });
+    };
+    attempt();
+  });
+}
+
+function multipartBody(fields, audio) {
+  const boundary = `jarvis${crypto.randomUUID().replace(/-/g, "")}`;
+  const chunks = [];
+  for (const [name, value] of fields) {
+    chunks.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+    ));
+  }
+  chunks.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="speech.wav"\r\nContent-Type: audio/wav\r\n\r\n`,
+  ));
+  chunks.push(audio);
+  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  return { boundary, payload: Buffer.concat(chunks) };
+}
+
+function httpPost(port, requestPath, contentType, payload) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      hostname: "127.0.0.1",
+      port,
+      path: requestPath,
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": payload.length,
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        if (response.statusCode !== 200) {
+          reject(new Error(`Whisper server returned HTTP ${response.statusCode}.`));
+          return;
+        }
+        resolve(text);
+      });
+    });
+    request.setTimeout(30000, () => {
+      request.destroy(new Error("The warm Whisper request timed out."));
+    });
+    request.once("error", reject);
+    request.end(payload);
+  });
 }
 
 module.exports = { VoiceRuntime };
