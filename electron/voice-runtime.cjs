@@ -213,6 +213,7 @@ class VoiceRuntime {
         "-sns",
         "-nt",
         "-np",
+        "--prompt", language === "hi" ? "हे जार्विस।" : "Hey Jarvis.",
       ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";

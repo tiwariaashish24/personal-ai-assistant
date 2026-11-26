@@ -425,7 +425,8 @@
 
   function extractWakeCommand(value) {
     const text = String(value || "").normalize("NFKC");
-    const pattern = /(?:^|[\s,!?।])(?:hey\s+jarvis|hi\s+jarvis|okay\s+jarvis|ok\s+jarvis|हे\s*जार्विस|है\s*जार्विस|\.\s*जार्विस)(?=$|[\s,!?।])/iu;
+    // Whisper's base model often drops "Hey" and writes Jarvis as Zavis.
+    const pattern = /(?:^|[\s,!?।])(?:(?:hey|hi|okay|ok)\s+|(?:हे|है)\s*)?(?:jarvis|jervis|jarvice|javis|jarves|zavis|जार्विस)(?=$|[\s,!?।])/iu;
     const match = pattern.exec(text);
     if (!match) {
       return { activated: false, command: "" };
@@ -434,6 +435,7 @@
       activated: true,
       command: (text.slice(0, match.index) + text.slice(match.index + match[0].length))
         .replace(/^[\s,.:;!?।-]+/, "")
+        .replace(/[.।]+$/u, "")
         .trim(),
     };
   }
@@ -721,6 +723,7 @@
     isValidTranscript,
     isWithinQuietHours,
     normalizeCommand,
+    sanitizeTranscript,
     normalizeVoicePreferences,
     normalizeSpeechText,
     resolveConversationCommand,

@@ -32,8 +32,16 @@ test("wake phrase activates only on the explicit phrase and preserves its comman
     activated: true,
     command: "कैलेंडर खोलो",
   });
-  assert.equal(extractWakeCommand("Jarvis, open my calendar").activated, false);
+  assert.deepEqual(extractWakeCommand("Jarvis, open my calendar"), {
+    activated: true,
+    command: "open my calendar",
+  });
+  assert.deepEqual(extractWakeCommand("Zavis Open Chrome."), {
+    activated: true,
+    command: "Open Chrome",
+  });
   assert.equal(extractWakeCommand("Open my calendar").activated, false);
+  assert.equal(extractWakeCommand("These are with open chrome.").activated, false);
 });
 
 test("conversation accepts follow-ups without a wake phrase only during an active session", () => {
