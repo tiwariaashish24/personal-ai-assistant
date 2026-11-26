@@ -40,6 +40,14 @@ test("wake phrase activates only on the explicit phrase and preserves its comman
     activated: true,
     command: "Open Chrome",
   });
+  assert.deepEqual(extractWakeCommand("Here is Jarvis Open Chrome."), {
+    activated: true,
+    command: "Open Chrome",
+  });
+  assert.deepEqual(extractWakeCommand("Hi Jarvis."), {
+    activated: true,
+    command: "",
+  });
   assert.equal(extractWakeCommand("Open my calendar").activated, false);
   assert.equal(extractWakeCommand("These are with open chrome.").activated, false);
 });

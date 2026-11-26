@@ -426,14 +426,14 @@
   function extractWakeCommand(value) {
     const text = String(value || "").normalize("NFKC");
     // Whisper's base model often drops "Hey" and writes Jarvis as Zavis.
-    const pattern = /(?:^|[\s,!?।])(?:(?:hey|hi|okay|ok)\s+|(?:हे|है)\s*)?(?:jarvis|jervis|jarvice|javis|jarves|zavis|जार्विस)(?=$|[\s,!?।])/iu;
+    const pattern = /(?:^|[\s,.!?।])(?:(?:hey|hi|okay|ok)\s+|(?:हे|है)\s*)?(?:jarvis|jervis|jarvice|javis|jarves|zavis|जार्विस)(?=$|[\s,.!?।])/iu;
     const match = pattern.exec(text);
     if (!match) {
       return { activated: false, command: "" };
     }
     return {
       activated: true,
-      command: (text.slice(0, match.index) + text.slice(match.index + match[0].length))
+      command: text.slice(match.index + match[0].length)
         .replace(/^[\s,.:;!?।-]+/, "")
         .replace(/[.।]+$/u, "")
         .trim(),
