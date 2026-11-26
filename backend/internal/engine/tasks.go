@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"jarvis/internal/reminders"
 )
 
 const (
@@ -63,15 +65,22 @@ func NewTaskManager() *TaskManager {
 }
 
 func (m *TaskManager) Start(description string, timeout time.Duration, run func(context.Context) (string, error)) (BackgroundTask, error) {
+	return m.StartWithID("", description, timeout, run)
+}
+
+func (m *TaskManager) StartWithID(id, description string, timeout time.Duration, run func(context.Context) (string, error)) (BackgroundTask, error) {
 	if run == nil {
 		return BackgroundTask{}, errors.New("background task requires a runner")
 	}
 	if timeout <= 0 {
 		timeout = defaultTaskTimeout
 	}
-	id, err := newTaskID()
-	if err != nil {
-		return BackgroundTask{}, fmt.Errorf("create background task id: %w", err)
+	if id == "" {
+		var err error
+		id, err = newTaskID()
+		if err != nil {
+			return BackgroundTask{}, fmt.Errorf("create background task id: %w", err)
+		}
 	}
 	now := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
@@ -90,6 +99,11 @@ func (m *TaskManager) Start(description string, timeout time.Duration, run func(
 		m.mu.Unlock()
 		cancel()
 		return BackgroundTask{}, errors.New("background task manager is closed")
+	}
+	if _, exists := m.tasks[id]; exists {
+		m.mu.Unlock()
+		cancel()
+		return BackgroundTask{}, fmt.Errorf("background task %q already exists", id)
 	}
 	m.tasks[id] = entry
 	m.pruneLocked()
@@ -208,6 +222,11 @@ func (e *Engine) cancelTask(id string) (Result, error) {
 	if err := e.tasks.Cancel(id); err != nil {
 		return Result{}, err
 	}
+	if e.reminders != nil {
+		if err := e.reminders.MarkCancelled(id); err != nil && !errors.Is(err, reminders.ErrNotFound) {
+			return Result{}, fmt.Errorf("cancel reminder record: %w", err)
+		}
+	}
 	return Result{Output: "Cancellation requested for background task " + id + "."}, nil
 }
 
@@ -220,20 +239,98 @@ func (e *Engine) scheduleReminder(delayText, message string) (string, error) {
 	if message == "" || len(message) > 1000 {
 		return "", errors.New("reminder message must contain 1 to 1000 characters")
 	}
-	task, err := e.tasks.Start("Reminder: "+message, delay+time.Minute, func(ctx context.Context) (string, error) {
-		timer := time.NewTimer(delay)
+	dueAt := time.Now().UTC().Add(delay)
+	return e.schedulePersistedReminder(message, dueAt, delay)
+}
+
+func (e *Engine) schedulePersistedReminder(message string, dueAt time.Time, delay time.Duration) (string, error) {
+	id, err := newTaskID()
+	if err != nil {
+		return "", fmt.Errorf("create reminder id: %w", err)
+	}
+	if e.reminders != nil {
+		if err := e.reminders.Create(reminders.Reminder{
+			ID:      id,
+			Message: message,
+			DueAt:   dueAt,
+		}); err != nil {
+			return "", err
+		}
+	}
+	timeout := delay + time.Minute
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	task, err := e.tasks.StartWithID(id, "Reminder: "+message, timeout, func(ctx context.Context) (string, error) {
+		remaining := time.Until(dueAt)
+		if remaining < 0 {
+			remaining = 0
+		}
+		timer := time.NewTimer(remaining)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-timer.C:
-			return "Reminder: " + message, nil
 		}
+		if e.reminders != nil {
+			if err := e.reminders.MarkCompleted(id); err != nil {
+				return "", fmt.Errorf("complete reminder record: %w", err)
+			}
+		}
+		return "Reminder: " + message, nil
 	})
 	if err != nil {
+		if e.reminders != nil {
+			_ = e.reminders.MarkCancelled(id)
+		}
 		return "", err
 	}
-	return fmt.Sprintf("Scheduled reminder %s for %s from now (task %s).", message, delay, task.ID), nil
+	return fmt.Sprintf("Scheduled reminder %s for %s (task %s).", message, dueAt.Local().Format(time.RFC3339), task.ID), nil
+}
+
+func (e *Engine) restoreReminders() {
+	if e.reminders == nil {
+		return
+	}
+	pending, err := e.reminders.Pending()
+	if err != nil {
+		return
+	}
+	for _, reminder := range pending {
+		delay := time.Until(reminder.DueAt)
+		if delay < time.Second {
+			delay = time.Second
+		}
+		if delay > 30*24*time.Hour {
+			delay = 30 * 24 * time.Hour
+		}
+		_, _ = e.schedulePersistedReminderAtID(reminder.ID, reminder.Message, reminder.DueAt, delay)
+	}
+}
+
+func (e *Engine) schedulePersistedReminderAtID(id, message string, dueAt time.Time, delay time.Duration) (BackgroundTask, error) {
+	timeout := delay + time.Minute
+	task, err := e.tasks.StartWithID(id, "Reminder: "+message, timeout, func(ctx context.Context) (string, error) {
+		remaining := time.Until(dueAt)
+		if remaining < 0 {
+			remaining = 0
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		if e.reminders != nil {
+			if err := e.reminders.MarkCompleted(id); err != nil {
+				return "", fmt.Errorf("complete reminder record: %w", err)
+			}
+		}
+		return "Reminder: " + message, nil
+	})
+	return task, err
 }
 
 func (m *TaskManager) pruneLocked() {

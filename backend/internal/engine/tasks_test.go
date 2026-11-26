@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,49 @@ func TestReminderCommandCreatesCancelableTask(t *testing.T) {
 	}
 	if _, err := assistant.Execute("remind 0s invalid"); err == nil {
 		t.Fatal("expected invalid reminder duration to be rejected")
+	}
+}
+
+func TestReminderPersistsAcrossEngineRestart(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("JARVIS_DB_PATH", filepath.Join(t.TempDir(), "jarvis.db"))
+
+	first, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Execute("remind 1h persisted reminder"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("close restarted assistant: %v", err)
+		}
+	}()
+
+	pending, err := second.reminders.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Message != "persisted reminder" {
+		t.Fatalf("restored reminders = %#v", pending)
+	}
+	restored := false
+	for _, task := range second.tasks.List() {
+		if task.Description == "Reminder: persisted reminder" {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Fatalf("restored tasks = %#v", second.tasks.List())
 	}
 }
 

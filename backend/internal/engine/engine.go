@@ -15,6 +15,7 @@ import (
 	"jarvis/internal/config"
 	"jarvis/internal/integrations"
 	"jarvis/internal/permissions"
+	"jarvis/internal/reminders"
 )
 
 const helpText = `Commands:
@@ -68,6 +69,7 @@ type Engine struct {
 	permissions  *permissions.Store
 	integrations *integrations.Manager
 	tasks        *TaskManager
+	reminders    *reminders.Store
 	pendingMu    sync.Mutex
 	pending      map[string]pendingAction
 }
@@ -109,7 +111,13 @@ func New(workspace string) (*Engine, error) {
 		_ = permissionStore.Close()
 		return nil, fmt.Errorf("initialize communication integrations: %w", err)
 	}
-	return &Engine{
+	reminderStore, err := reminders.Open(cfg.DBPath)
+	if err != nil {
+		_ = integrationManager.Close()
+		_ = permissionStore.Close()
+		return nil, fmt.Errorf("initialize reminders: %w", err)
+	}
+	assistant := &Engine{
 		root:         root,
 		launch:       startApplication,
 		openURL:      openURL,
@@ -117,7 +125,10 @@ func New(workspace string) (*Engine, error) {
 		permissions:  permissionStore,
 		integrations: integrationManager,
 		tasks:        NewTaskManager(),
-	}, nil
+		reminders:    reminderStore,
+	}
+	assistant.restoreReminders()
+	return assistant, nil
 }
 
 func (e *Engine) Execute(input string) (Result, error) {
@@ -153,6 +164,11 @@ func (e *Engine) Close() error {
 	}
 	if e.integrations != nil {
 		if err := e.integrations.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	if e.reminders != nil {
+		if err := e.reminders.Close(); err != nil {
 			closeErrors = append(closeErrors, err)
 		}
 	}

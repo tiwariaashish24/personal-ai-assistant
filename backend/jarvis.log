@@ -3,3 +3,4 @@
 2026/11/26 16:23:29.390882 ERROR stdio command loop failed: write response: write /dev/stdout: The pipe is being closed.
 2026/11/26 16:26:22.491372 ERROR command failed: app must be chrome, vscode, or notepad
 2026/11/26 16:34:24.946466 ERROR command failed: app must be chrome, vscode, or notepad
+2026/11/26 17:11:12.039026 ERROR command failed: wait for Google authorization: context deadline exceeded
