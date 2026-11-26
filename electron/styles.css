@@ -321,6 +321,7 @@ h1 {
 .tasks-panel,
 .integrations-panel,
 .conversation-panel,
+.pipeline-panel,
 .settings-panel {
   border: 1px solid var(--line);
   border-radius: 15px;
@@ -330,6 +331,38 @@ h1 {
 .settings-panel {
   margin-top: 15px;
   padding: 15px 16px;
+}
+
+.pipeline-panel {
+  margin-top: 15px;
+  padding: 15px 16px;
+}
+
+.pipeline-panel h2 {
+  margin: 0 0 10px;
+  color: #d3e2f6;
+  font-size: 13px;
+}
+
+.pipeline-panel pre,
+.pipeline-panel output {
+  display: block;
+  overflow: auto;
+  margin: 0;
+  color: #9cabc0;
+  font: 11px/1.6 Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pipeline-panel details {
+  margin-top: 10px;
+}
+
+.pipeline-panel summary {
+  color: #a7b5ca;
+  cursor: pointer;
+  font-size: 11px;
 }
 
 .settings-panel summary {

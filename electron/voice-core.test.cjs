@@ -14,9 +14,11 @@ const {
   isWithinQuietHours,
   normalizeCommand,
   normalizeVoicePreferences,
+  resumeAudioContext,
   resolveConversationCommand,
   resemblesEcho,
   resampleTo16k,
+  shouldRestoreListeningStatus,
   shouldSpeakProactive,
   updateVoicePreference,
 } = require("./voice-core.js");
@@ -57,6 +59,66 @@ test("voice activity segmenter keeps pre-roll and ends after silence", () => {
   assert.ok(Math.abs(utterance[100] - 0.1) < 1e-6);
 });
 
+test("short, low-level wake speech survives VAD and transcript gating", () => {
+  const segmenter = new VoiceActivitySegmenter({ sampleRate: 16000, silenceMs: 100 });
+  let utterance;
+  for (let frame = 0; frame < 24; frame += 1) {
+    const samples = new Float32Array(160);
+    for (let index = 0; index < samples.length; index += 1) {
+      const time = (frame * samples.length + index) / 16000;
+      const envelope = 0.035 + 0.018 * Math.sin(2 * Math.PI * 4 * time);
+      samples[index] = envelope * Math.sin(2 * Math.PI * 180 * time);
+    }
+    utterance = segmenter.push(samples) || utterance;
+  }
+  for (let frame = 0; frame < 10; frame += 1) {
+    utterance = segmenter.push(new Float32Array(160)) || utterance;
+  }
+  assert.ok(utterance);
+  assert.ok(utterance.length >= 16000 * 0.25);
+  assert.equal(isSpeechLikeAudio(utterance), true);
+  assert.equal(isValidTranscript("Hey Jarvis"), true);
+  assert.equal(resolveConversationCommand("Hey Jarvis", false), "");
+});
+
+test("suspended microphone AudioContext is resumed and invalid state is surfaced", async () => {
+  const context = {
+    state: "suspended",
+    sampleRate: 48000,
+    resume: async function resume() {
+      this.state = "running";
+    },
+  };
+  assert.equal(await resumeAudioContext(context), 48000);
+  await assert.rejects(
+    resumeAudioContext({ state: "closed", sampleRate: 16000, resume: async () => {} }),
+    /unavailable or closed/,
+  );
+  await assert.rejects(
+    resumeAudioContext({ state: "suspended", sampleRate: 16000, resume: async () => {} }),
+    /cannot proceed/,
+  );
+  await assert.rejects(
+    resumeAudioContext({ state: "suspended", sampleRate: 16000, resume: () => new Promise(() => {}) }, 5),
+    /resume timed out/,
+  );
+});
+
+test("transcription failures are not replaced with the standby status", () => {
+  assert.equal(shouldRestoreListeningStatus({
+    listening: true,
+    voiceState: "Error",
+    processing: false,
+    failed: true,
+  }), false);
+  assert.equal(shouldRestoreListeningStatus({
+    listening: true,
+    voiceState: "Thinking",
+    processing: false,
+    failed: false,
+  }), true);
+});
+
 test("voice onset detector requires sustained speech and resets on silence", () => {
   const detector = new VoiceOnsetDetector({
     sampleRate: 1000,
@@ -85,6 +147,13 @@ test("voice WAV encoding produces mono 16-bit PCM", () => {
 test("audio resampling and echo detection handle supported speech input", () => {
   const input = new Float32Array([0, 1, 0, -1]);
   assert.equal(resampleTo16k(input, 32000).length, 2);
+  const nativeRateSpeech = Float32Array.from(
+    { length: 4800 },
+    (_, index) => 0.1 * Math.sin(2 * Math.PI * 440 * index / 48000),
+  );
+  const resampledSpeech = resampleTo16k(nativeRateSpeech, 48000);
+  assert.equal(resampledSpeech.length, 1600);
+  assert.ok(analyzeAudio(resampledSpeech).rms > 0.06);
   assert.equal(resemblesEcho("Your reminder is ready", "Your reminder is ready now"), true);
   assert.equal(resemblesEcho("Cancel that", "Your reminder is ready now"), false);
 });

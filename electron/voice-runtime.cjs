@@ -8,6 +8,36 @@ const maxAudioBytes = 1024 * 1024;
 const maxOutputBytes = 64 * 1024;
 const maxQueuedSpeech = 16;
 
+function audioBufferFromIPC(wav) {
+  if (Buffer.isBuffer(wav)) {
+    return wav;
+  }
+  if (wav instanceof ArrayBuffer) {
+    return Buffer.from(wav);
+  }
+  if (ArrayBuffer.isView(wav)) {
+    return Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength);
+  }
+  throw new Error("Voice input must arrive as an ArrayBuffer or byte array.");
+}
+
+function isMonoPcm16kWav(audio) {
+  return audio.length >= 44 &&
+    audio.toString("ascii", 0, 4) === "RIFF" &&
+    audio.readUInt32LE(4) === audio.length - 8 &&
+    audio.toString("ascii", 8, 12) === "WAVE" &&
+    audio.toString("ascii", 12, 16) === "fmt " &&
+    audio.readUInt32LE(16) === 16 &&
+    audio.readUInt16LE(20) === 1 &&
+    audio.readUInt16LE(22) === 1 &&
+    audio.readUInt32LE(24) === 16000 &&
+    audio.readUInt32LE(28) === 32000 &&
+    audio.readUInt16LE(32) === 2 &&
+    audio.readUInt16LE(34) === 16 &&
+    audio.toString("ascii", 36, 40) === "data" &&
+    audio.readUInt32LE(40) === audio.length - 44;
+}
+
 class VoiceRuntime {
   constructor({ voiceDirectory, onState = () => {}, spawnProcess = spawn, platform = process.platform }) {
     this.voiceDirectory = voiceDirectory;
@@ -24,6 +54,9 @@ class VoiceRuntime {
     this.modelPaths = {};
     this.selectedModel = "base";
     this.sapiVoice = "";
+    this.whisperActive = 0;
+    this.whisperLast = { status: "idle" };
+    this.speechLast = { status: "idle" };
   }
 
   async initialize(dotEnvPaths = []) {
@@ -124,14 +157,33 @@ class VoiceRuntime {
     return { available: true, message: "Offline Whisper and Windows SAPI are ready." };
   }
 
+  async diagnostics() {
+    return {
+      ...(await this.availability()),
+      executablePath: this.binaryPath,
+      selectedModel: this.selectedModel,
+      modelPath: this.modelPath,
+      models: await this.modelAvailability(),
+      whisper: {
+        active: this.whisperActive > 0,
+        activeCount: this.whisperActive,
+        last: { ...this.whisperLast },
+      },
+      speech: {
+        active: Boolean(this.speechProcess || this.speechPump),
+        queued: this.speechQueue.length,
+        last: { ...this.speechLast },
+      },
+    };
+  }
+
   async transcribe(wav, language = "auto") {
     if (!["auto", "en", "hi"].includes(language)) {
       throw new Error("Offline speech language must be auto, en, or hi.");
     }
-    const audio = Buffer.isBuffer(wav) ? wav : Buffer.from(wav);
-    if (audio.length < 44 || audio.length > maxAudioBytes ||
-        audio.toString("ascii", 0, 4) !== "RIFF" || audio.toString("ascii", 8, 12) !== "WAVE") {
-      throw new Error("Voice input must be a WAV recording under 1 MiB.");
+    const audio = audioBufferFromIPC(wav);
+    if (audio.length > maxAudioBytes || !isMonoPcm16kWav(audio)) {
+      throw new Error("Voice input must be a valid 16 kHz mono 16-bit PCM WAV recording under 1 MiB.");
     }
     const runtime = await this.availability();
     if (!runtime.available) {
@@ -149,6 +201,7 @@ class VoiceRuntime {
 
   runWhisper(audioPath, language) {
     return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
       const child = this.spawnProcess(this.binaryPath, [
         "-m", this.modelPath,
         "-f", audioPath,
@@ -164,6 +217,13 @@ class VoiceRuntime {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      this.whisperActive += 1;
+      this.whisperLast = {
+        status: "running",
+        startedAt: new Date(startedAt).toISOString(),
+        model: this.selectedModel,
+        language,
+      };
       const timeout = setTimeout(() => {
         child.kill();
         finish(new Error("Offline speech recognition timed out."));
@@ -174,6 +234,15 @@ class VoiceRuntime {
         }
         settled = true;
         clearTimeout(timeout);
+        this.whisperActive = Math.max(0, this.whisperActive - 1);
+        this.whisperLast = {
+          ...this.whisperLast,
+          status: error ? "failed" : "completed",
+          finishedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAt,
+          transcriptChars: typeof value === "string" ? value.length : 0,
+          error: error ? error.message : "",
+        };
         if (error) {
           reject(error);
         } else {
@@ -220,6 +289,7 @@ class VoiceRuntime {
       return Promise.reject(new Error("Speech queue is full; wait for current speech to finish."));
     }
     return new Promise((resolve, reject) => {
+      this.speechLast = { status: "queued", queuedAt: new Date().toISOString(), characters: spokenText.length };
       this.speechQueue.push({ text: spokenText, resolve, reject });
       this.pumpSpeech();
     });
@@ -260,6 +330,8 @@ class VoiceRuntime {
   }
 
   speakOne(spokenText) {
+    const startedAt = Date.now();
+    this.speechLast = { status: "speaking", startedAt: new Date(startedAt).toISOString(), characters: spokenText.length };
     const textBase64 = Buffer.from(spokenText, "utf16le").toString("base64");
     const voiceBase64 = Buffer.from(this.sapiVoice, "utf16le").toString("base64");
     const script = [
@@ -296,6 +368,13 @@ class VoiceRuntime {
         }
         settled = true;
         clearTimeout(timeout);
+        this.speechLast = {
+          ...this.speechLast,
+          status: this.interruptedSpeech.has(child) ? "interrupted" : error ? "failed" : "completed",
+          finishedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAt,
+          error: error ? error.message : "",
+        };
         if (error) {
           reject(error);
         } else {
@@ -351,6 +430,7 @@ class VoiceRuntime {
     if (child) {
       this.interruptedSpeech.add(child);
       this.speechProcess = null;
+      this.speechLast = { ...this.speechLast, status: "interrupting", interruptedAt: new Date().toISOString() };
       child.kill();
       this.onState("Listening");
     }

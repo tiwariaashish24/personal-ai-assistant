@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { VoiceRuntime } = require("./voice-runtime.cjs");
 const voiceCore = require("./voice-core.js");
+const { appendVoiceDiagnostic } = require("./voice-diagnostics.cjs");
 
 const backendDirectory = path.resolve(__dirname, "..", "backend");
 let mainWindow;
@@ -128,6 +129,15 @@ async function toggleVoicePreference(action) {
 
 function preferencesPath() {
   return path.join(app.getPath("userData"), "preferences.json");
+}
+
+function voiceDiagnosticsPath() {
+  return path.join(app.getPath("userData"), "voice-diagnostics.log");
+}
+
+async function writeVoiceDiagnostic(event, record) {
+  checkTrustedWindow(event);
+  await appendVoiceDiagnostic(voiceDiagnosticsPath(), record);
 }
 
 async function loadVoicePreferences() {
@@ -545,7 +555,8 @@ function registerIPC() {
       ...voicePreferences,
       state: voiceState,
       detail: voiceDetail,
-      runtime: voiceAvailability,
+      runtime: await voiceRuntime.diagnostics(),
+      diagnosticLogPath: voiceDiagnosticsPath(),
       whisperModels: await voiceRuntime.modelAvailability(),
       hinglishLanguage: voiceRuntime.hinglishLanguage,
     };
@@ -555,7 +566,7 @@ function registerIPC() {
     const updated = await updateVoiceSetting(key, value);
     return {
       ...updated,
-      runtime: await voiceRuntime.availability(),
+      runtime: await voiceRuntime.diagnostics(),
       whisperModels: await voiceRuntime.modelAvailability(),
       hinglishLanguage: voiceRuntime.hinglishLanguage,
     };
@@ -579,6 +590,18 @@ function registerIPC() {
   ipcMain.handle("jarvis:diagnostics", async (event) => {
     checkTrustedWindow(event);
     return getPerformanceDiagnostics();
+  });
+  ipcMain.handle("jarvis:voice-diagnostics", async (event) => {
+    checkTrustedWindow(event);
+    return {
+      voice: { state: voiceState, detail: voiceDetail },
+      runtime: voiceRuntime ? await voiceRuntime.diagnostics() : { available: false, message: "Voice runtime is not initialized." },
+      backend: {
+        connected: Boolean(assistantProcess),
+        pid: assistantProcess?.pid || null,
+        pendingRequests: pendingRequests.length,
+      },
+    };
   });
   ipcMain.on("jarvis:voice-state", (event, update) => {
     if (!mainWindow || event.sender !== mainWindow.webContents ||

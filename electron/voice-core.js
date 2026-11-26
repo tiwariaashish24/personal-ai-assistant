@@ -191,7 +191,7 @@
       return false;
     }
     const stats = analyzeAudio(samples);
-    if (stats.rms < 0.008 || stats.peak < 0.02 || stats.clippedRatio > 0.12 ||
+    if (stats.rms < 0.006 || stats.peak < 0.015 || stats.clippedRatio > 0.12 ||
         stats.zeroCrossingRate < 0.002 || stats.zeroCrossingRate > 0.48) {
       return false;
     }
@@ -203,7 +203,7 @@
         sumSquares += samples[index] * samples[index];
       }
       const frameRms = Math.sqrt(sumSquares / frameSize);
-      if (frameRms >= 0.006) {
+      if (frameRms >= 0.004) {
         energies.push(frameRms);
       }
     }
@@ -212,7 +212,40 @@
     }
     const mean = energies.reduce((total, value) => total + value, 0) / energies.length;
     const variance = energies.reduce((total, value) => total + (value - mean) ** 2, 0) / energies.length;
-    return mean > 0 && Math.sqrt(variance) / mean >= 0.006;
+    return mean > 0 && Math.sqrt(variance) / mean >= 0.04;
+  }
+
+  async function resumeAudioContext(context, timeoutMs = 3000) {
+    if (!context || context.state === "closed") {
+      throw new Error("The microphone AudioContext is unavailable or closed.");
+    }
+    if (context.state !== "running") {
+      let timeout;
+      try {
+        await Promise.race([
+          context.resume(),
+          new Promise((resolve, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error("AudioContext resume timed out; click Retry microphone.")),
+              timeoutMs,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    if (context.state !== "running") {
+      throw new Error(`The microphone AudioContext is ${context.state}; audio capture cannot proceed.`);
+    }
+    if (!Number.isFinite(context.sampleRate) || context.sampleRate <= 0) {
+      throw new Error("The microphone AudioContext reported an invalid sample rate.");
+    }
+    return context.sampleRate;
+  }
+
+  function shouldRestoreListeningStatus({ listening, voiceState, processing, failed }) {
+    return listening && voiceState !== "Speaking" && !processing && !failed;
   }
 
   class StreamingSpeechQueue {
@@ -392,7 +425,7 @@
 
   function extractWakeCommand(value) {
     const text = String(value || "").normalize("NFKC");
-    const pattern = /(?:^|[\s,!?।])(?:hey\s+jarvis|हे\s*जार्विस)(?=$|[\s,!?।])/iu;
+    const pattern = /(?:^|[\s,!?।])(?:hey\s+jarvis|hi\s+jarvis|okay\s+jarvis|ok\s+jarvis|हे\s*जार्विस|है\s*जार्विस|\.\s*जार्विस)(?=$|[\s,!?।])/iu;
     const match = pattern.exec(text);
     if (!match) {
       return { activated: false, command: "" };
@@ -433,6 +466,71 @@
     return output;
   }
 
+  class StreamingResampler {
+    constructor(inputRate, outputRate = TARGET_SAMPLE_RATE) {
+      if (!Number.isFinite(inputRate) || inputRate <= 0 ||
+          !Number.isFinite(outputRate) || outputRate <= 0) {
+        throw new TypeError("resampler rates must be positive numbers");
+      }
+      this.inputRate = inputRate;
+      this.outputRate = outputRate;
+      this.step = inputRate / outputRate;
+      this.buffer = [];
+      this.buffered = 0;
+      this.readIndex = 0;
+    }
+
+    push(input) {
+      if (!(input instanceof Float32Array) || input.length === 0) {
+        return new Float32Array(0);
+      }
+      for (const sample of input) {
+        this.buffer.push(sample);
+      }
+      this.buffered += input.length;
+      const output = [];
+      while (this.readIndex + 1 < this.buffered) {
+        const before = Math.floor(this.readIndex);
+        const fraction = this.readIndex - before;
+        const first = this.buffer[before];
+        const second = this.buffer[before + 1];
+        output.push(first * (1 - fraction) + second * fraction);
+        this.readIndex += this.step;
+      }
+      this.compact();
+      return Float32Array.from(output);
+    }
+
+    compact() {
+      if (this.buffered === 0) {
+        return;
+      }
+      const keepFrom = Math.max(0, Math.min(this.buffered - 2, Math.floor(this.readIndex) - 1));
+      if (keepFrom <= 0) {
+        return;
+      }
+      this.buffer = this.buffer.slice(keepFrom);
+      this.buffered -= keepFrom;
+      this.readIndex -= keepFrom;
+    }
+
+    flush() {
+      const output = [];
+      while (this.readIndex < this.buffered) {
+        const before = Math.min(Math.floor(this.readIndex), this.buffered - 1);
+        const fraction = Math.min(1, this.readIndex - before);
+        const first = this.buffer[before];
+        const second = this.buffer[Math.min(before + 1, this.buffered - 1)];
+        output.push(first * (1 - fraction) + second * fraction);
+        this.readIndex += this.step;
+      }
+      this.buffer = [];
+      this.buffered = 0;
+      this.readIndex = 0;
+      return Float32Array.from(output);
+    }
+  }
+
   function encodeWav(samples, sampleRate = TARGET_SAMPLE_RATE) {
     if (!(samples instanceof Float32Array) || sampleRate <= 0) {
       throw new TypeError("audio samples and a positive sample rate are required");
@@ -467,11 +565,12 @@
   class VoiceActivitySegmenter {
     constructor(options = {}) {
       this.sampleRate = options.sampleRate || TARGET_SAMPLE_RATE;
-      this.threshold = options.threshold || 0.018;
+      this.threshold = options.threshold ?? 0.012;
       this.silenceSamples = Math.floor(this.sampleRate * (options.silenceMs || 700) / 1000);
-      this.minimumSamples = Math.floor(this.sampleRate * (options.minimumMs || 300) / 1000);
+      this.minimumSamples = Math.floor(this.sampleRate * (options.minimumMs || 180) / 1000);
       this.maximumSamples = Math.floor(this.sampleRate * (options.maximumMs || 12000) / 1000);
       this.preRollSamples = Math.floor(this.sampleRate * (options.preRollMs || 240) / 1000);
+      this.lastFrameVoiced = false;
       this.reset();
     }
 
@@ -483,6 +582,7 @@
       this.voicedSamples = 0;
       this.silentLength = 0;
       this.active = false;
+      this.lastFrameVoiced = false;
     }
 
     push(samples) {
@@ -497,6 +597,7 @@
         sum += sample * sample;
       }
       const voiced = Math.sqrt(sum / samples.length) >= this.threshold;
+      this.lastFrameVoiced = voiced;
 
       if (!this.active) {
         this.keepPreRoll(samples);
@@ -607,6 +708,7 @@
   return {
     TARGET_SAMPLE_RATE,
     VOICE_PREFERENCE_DEFAULTS,
+    StreamingResampler,
     StreamingSpeechQueue,
     VoiceOnsetDetector,
     VoiceActivitySegmenter,
@@ -624,6 +726,8 @@
     resolveConversationCommand,
     resemblesEcho,
     resampleTo16k,
+    resumeAudioContext,
+    shouldRestoreListeningStatus,
     shouldSpeakProactive,
     updateVoicePreference,
   };

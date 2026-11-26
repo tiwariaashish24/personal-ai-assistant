@@ -115,6 +115,16 @@ Voice latency readings report Whisper transcription, first AI text token, and
 first SAPI speech-start times for the latest voice request. These readings are
 local and are not uploaded.
 
+The **Voice pipeline status** panel shows the selected microphone, AudioContext
+state and sample rate, AudioWorklet frame count, captured duration, VAD settings
+and decisions, Whisper executable/model paths, transcript state, wake-word
+decision, Go command status, and SAPI playback status. AudioContext is resumed
+explicitly and capture fails visibly if no worklet frames arrive within three
+seconds. The latest raw Whisper transcript is shown temporarily and cleared
+after 15 seconds; transcripts are not written to diagnostic logs. Pipeline
+errors are persisted locally to `voice-diagnostics.log` in Electron's user-data
+directory, with a 1 MiB size cap.
+
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.
 

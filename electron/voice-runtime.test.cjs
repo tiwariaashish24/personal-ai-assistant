@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { PassThrough } = require("node:stream");
 const { VoiceRuntime } = require("./voice-runtime.cjs");
+const { encodeWav } = require("./voice-core.js");
 
 test("offline transcription rejects unsupported languages and malformed audio", async () => {
   const runtime = new VoiceRuntime({ voiceDirectory: "unused" });
@@ -18,6 +19,21 @@ test("offline transcription rejects unsupported languages and malformed audio", 
     /WAV recording under 1 MiB/,
   );
   assert.equal(runtime.interrupt(), false);
+});
+
+test("offline transcription accepts structured-cloned WAV buffers from Electron IPC", async () => {
+  const runtime = new VoiceRuntime({ voiceDirectory: "unused" });
+  runtime.availability = async () => ({ available: true, message: "ready" });
+  runtime.runWhisper = async (audioPath) => {
+    const audio = await fs.readFile(audioPath);
+    assert.equal(audio.toString("ascii", 0, 4), "RIFF");
+    assert.equal(audio.readUInt32LE(24), 16000);
+    return "hey jarvis";
+  };
+  const encoded = encodeWav(new Float32Array(1600).fill(0.1), 16000);
+  const ipcClone = structuredClone(encoded);
+  assert.equal(await runtime.transcribe(ipcClone, "en"), "hey jarvis");
+  assert.equal(await runtime.transcribe(new Uint8Array(encoded), "en"), "hey jarvis");
 });
 
 test("offline voice defaults to the multilingual base model and bounded CPU threads", async () => {
@@ -37,13 +53,19 @@ test("offline voice defaults to the multilingual base model and bounded CPU thre
 test("offline voice selects either installed multilingual Whisper model", async () => {
   const voiceDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "jarvis-model-test-"));
   try {
+    const binaryPath = path.join(voiceDirectory, "whisper-cli.exe");
     const basePath = path.join(voiceDirectory, "ggml-base.bin");
     const smallPath = path.join(voiceDirectory, "ggml-small.bin");
+    await fs.writeFile(binaryPath, "whisper");
     await fs.writeFile(basePath, "base");
     await fs.writeFile(smallPath, "small");
-    const runtime = new VoiceRuntime({ voiceDirectory });
+    const runtime = new VoiceRuntime({ voiceDirectory, platform: "win32" });
     await runtime.initialize();
     assert.deepEqual(await runtime.modelAvailability(), { base: true, small: true });
+    const diagnostics = await runtime.diagnostics();
+    assert.equal(diagnostics.available, true);
+    assert.equal(diagnostics.executablePath, binaryPath);
+    assert.equal(diagnostics.modelPath, basePath);
     await runtime.selectModel("small");
     assert.equal(runtime.modelPath, smallPath);
     await assert.rejects(runtime.selectModel("tiny"), /Base or Small/);

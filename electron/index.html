@@ -65,6 +65,15 @@
         <p id="microphone-privacy" class="hint">Microphone starts only after local voice setup and permission.</p>
       </section>
 
+      <section class="pipeline-panel" aria-labelledby="pipeline-title">
+        <h2 id="pipeline-title">Voice pipeline status</h2>
+        <pre id="voice-pipeline-status" aria-live="polite"></pre>
+        <details>
+          <summary>Latest raw Whisper transcript (temporary)</summary>
+          <output id="raw-transcript">No transcript received yet.</output>
+        </details>
+      </section>
+
       <details class="settings-panel">
         <summary>Voice and communication settings</summary>
         <div class="settings-grid">

@@ -7,7 +7,7 @@
   "scripts": {
     "start": "electron .",
     "install:whisper": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\install-whisper.ps1",
-    "test": "node --test voice-core.test.cjs voice-runtime.test.cjs"
+    "test": "node --test voice-core.test.cjs voice-runtime.test.cjs voice-diagnostics.test.cjs voice-capture-worklet.test.cjs"
   },
   "devDependencies": {
     "electron": "^45.4.1"

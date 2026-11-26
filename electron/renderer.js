@@ -20,6 +20,8 @@ const backgroundTasks = document.querySelector("#background-tasks");
 const diagnosticsOutput = document.querySelector("#diagnostics-output");
 const diagnosticsButton = document.querySelector("#diagnostics-button");
 const latencyOutput = document.querySelector("#latency-output");
+const pipelineOutput = document.querySelector("#voice-pipeline-status");
+const rawTranscriptOutput = document.querySelector("#raw-transcript");
 
 let voiceSettings;
 let voiceState = "Offline";
@@ -59,6 +61,72 @@ const rendererStartedAt = Date.now();
 const announcedTaskIds = new Set();
 let captureGeneration = 0;
 let captureStartPromise;
+let cancelPendingFrameCheck;
+let audioContextResumePending = false;
+let audioFramesReceived = 0;
+let capturedSamples = 0;
+let lastPipelineRenderAt = 0;
+let rawTranscriptTimeout;
+const pipelineDiagnostics = {
+  microphone: "starting",
+  audioContext: "not initialized",
+  audioWorklet: "waiting for frames",
+  capturedAudio: "0.00 seconds",
+  vad: "waiting for speech",
+  lastUtterance: "none",
+  transcription: "idle",
+  wakeWord: "waiting for Hey Jarvis",
+  backend: "not tested",
+  speech: "idle",
+  whisper: "not checked",
+  diagnosticLog: "saved locally on errors",
+};
+
+function renderPipelineDiagnostics() {
+  const vadSettings = segmenter
+    ? `RMS ${segmenter.threshold.toFixed(3)}; min ${Math.round(segmenter.minimumSamples * 1000 / segmenter.sampleRate)} ms; silence ${Math.round(segmenter.silenceSamples * 1000 / segmenter.sampleRate)} ms`
+    : "RMS 0.012; min 180 ms; silence 700 ms";
+  pipelineOutput.textContent = [
+    `Microphone: ${pipelineDiagnostics.microphone}`,
+    `AudioContext: ${pipelineDiagnostics.audioContext}`,
+    `AudioWorklet: ${pipelineDiagnostics.audioWorklet}`,
+    `Captured audio: ${pipelineDiagnostics.capturedAudio}`,
+    `VAD: ${pipelineDiagnostics.vad} (${vadSettings})`,
+    `Last utterance: ${pipelineDiagnostics.lastUtterance}`,
+    `Whisper: ${pipelineDiagnostics.whisper}`,
+    `Transcription: ${pipelineDiagnostics.transcription}`,
+    `Wake word: ${pipelineDiagnostics.wakeWord}`,
+    `Go backend: ${pipelineDiagnostics.backend}`,
+    `Windows SAPI: ${pipelineDiagnostics.speech}`,
+    `Persistent errors: ${pipelineDiagnostics.diagnosticLog}`,
+  ].join("\n");
+}
+
+function updatePipelineDiagnostic(stage, status) {
+  if (pipelineDiagnostics[stage] === status) {
+    return;
+  }
+  pipelineDiagnostics[stage] = status;
+  renderPipelineDiagnostics();
+}
+
+function showRawTranscript(transcript) {
+  rawTranscriptOutput.textContent = transcript || "(empty transcript)";
+  window.clearTimeout(rawTranscriptTimeout);
+  rawTranscriptTimeout = window.setTimeout(() => {
+    rawTranscriptOutput.textContent = "Transcript cleared.";
+  }, 15000);
+}
+
+function reportVoiceError(stage, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  updatePipelineDiagnostic(stage, `ERROR: ${message}`);
+  setVoiceState("Error", message);
+  const logStage = stage.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`);
+  void window.jarvis.logVoiceDiagnostic({ stage: logStage, message }).catch((logError) => {
+    console.error(`Could not persist ${stage} diagnostic: ${logError.message}`);
+  });
+}
 
 function setStatus(message) {
   voiceDetail.textContent = message;
@@ -80,6 +148,7 @@ function setVoiceState(state, detail = "") {
     : listening
       ? "Local wake-word and speech recognition are active; no recordings are retained."
       : "Listening is paused; the microphone is off.";
+  updateMicrophoneButtons();
   window.jarvis.setVoiceState(state, detail);
 }
 
@@ -127,6 +196,7 @@ async function speak(text) {
   if (!text) {
     return;
   }
+  updatePipelineDiagnostic("speech", "requesting Windows SAPI playback");
   bargeInDetector?.reset();
   bargeInRequested = false;
   currentSpokenText = text;
@@ -134,12 +204,17 @@ async function speak(text) {
   setVoiceState("Speaking");
   try {
     await window.jarvis.speak(text);
+    updatePipelineDiagnostic("speech", "playback completed");
+  } catch (error) {
+    reportVoiceError("speech", error);
+    throw error;
   } finally {
     spokenEchoWindowUntil = Date.now() + 5000;
   }
 }
 
 async function interruptCurrentSpeech() {
+  updatePipelineDiagnostic("speech", "cancelled by voice interruption");
   currentSpokenText = "";
   spokenEchoWindowUntil = 0;
   if (activeSpeechQueue) {
@@ -150,7 +225,9 @@ async function interruptCurrentSpeech() {
 }
 
 function updateMicrophoneButtons() {
-  microphoneLabel.textContent = voiceSettings?.listeningEnabled ? "Pause listening" : "Resume listening";
+  microphoneLabel.textContent = voiceSettings?.listeningEnabled
+    ? voiceState === "Error" && !listening ? "Retry microphone" : "Pause listening"
+    : "Resume listening";
   muteButton.textContent = muted ? "Unmute microphone" : "Mute microphone";
   microphoneButton.disabled = false;
 }
@@ -230,6 +307,13 @@ function renderVoiceSettings() {
   document.querySelector("#proactive-cooldown").value = String(voiceSettings?.proactiveCooldownMinutes || 30);
 }
 
+function updateWhisperDiagnostics(runtime = voiceSettings?.runtime || {}) {
+  updatePipelineDiagnostic(
+    "whisper",
+    `${runtime.available ? "ready" : runtime.message || "unavailable"}; model=${runtime.selectedModel || voiceSettings?.whisperModel || "unknown"}; executable=${runtime.executablePath || "unknown"}; model path=${runtime.modelPath || "unknown"}`,
+  );
+}
+
 async function persistVoiceSetting(key, value) {
   try {
     return await saveVoiceSetting(key, value);
@@ -269,6 +353,8 @@ async function runPerformanceDiagnostics() {
 async function stopCapture(nextState = "Sleep", detail = "") {
   captureGeneration += 1;
   listening = false;
+  cancelPendingFrameCheck?.();
+  cancelPendingFrameCheck = undefined;
   activeConversation = false;
   window.clearTimeout(conversationTimer);
   if (audioNode) {
@@ -293,6 +379,10 @@ async function stopCapture(nextState = "Sleep", detail = "") {
   }
   bargeInDetector = undefined;
   bargeInRequested = false;
+  updatePipelineDiagnostic("microphone", "off");
+  updatePipelineDiagnostic("audioContext", "closed");
+  updatePipelineDiagnostic("audioWorklet", "stopped");
+  updatePipelineDiagnostic("vad", "paused");
   inputLevelMeter.value = 0;
   inputLevelLabel.textContent = "-inf dBFS";
   document.body.classList.remove("is-listening", "is-awake");
@@ -300,8 +390,29 @@ async function stopCapture(nextState = "Sleep", detail = "") {
   setVoiceState(nextState, detail);
 }
 
+async function resumeActiveAudioContext(context) {
+  if (audioContextResumePending) {
+    return false;
+  }
+  audioContextResumePending = true;
+  try {
+    const sampleRate = await voiceCore.resumeAudioContext(context);
+    updatePipelineDiagnostic("audioContext", `running at ${sampleRate} Hz; Whisper input is 16000 Hz`);
+    return true;
+  } catch (error) {
+    await stopCapture("Error", `Microphone AudioContext could not resume: ${error.message}`);
+    reportVoiceError("audioContext", error);
+    return false;
+  } finally {
+    audioContextResumePending = false;
+  }
+}
+
 async function startCapture() {
   if (listening) {
+    if (audioContext && audioContext.state !== "running") {
+      await resumeActiveAudioContext(audioContext);
+    }
     return;
   }
   if (captureStartPromise) {
@@ -312,13 +423,46 @@ async function startCapture() {
     return;
   }
   if (!voiceSettings?.runtime?.available) {
+    updatePipelineDiagnostic("whisper", voiceSettings?.runtime?.message || "Offline runtime unavailable");
     await stopCapture("Offline", voiceSettings?.runtime?.message || "Configure offline voice recognition.");
     return;
   }
   const generation = ++captureGeneration;
   captureStartPromise = (async () => {
     let failed = false;
+    let failureStage = "microphone";
+    let frameTimeout;
     try {
+      audioFramesReceived = 0;
+      capturedSamples = 0;
+      updatePipelineDiagnostic("microphone", "requesting access");
+      updatePipelineDiagnostic("audioWorklet", "loading");
+      updatePipelineDiagnostic("vad", "waiting for speech");
+      updatePipelineDiagnostic("transcription", "idle");
+      updatePipelineDiagnostic("wakeWord", "waiting for Hey Jarvis");
+      failureStage = "audioContext";
+      try {
+        audioContext = new AudioContext({ sampleRate: voiceCore.TARGET_SAMPLE_RATE });
+      } catch {
+        audioContext = new AudioContext();
+        updatePipelineDiagnostic("audioContext", `16 kHz unavailable; will resample from ${audioContext.sampleRate} Hz`);
+      }
+      const context = audioContext;
+      context.addEventListener("statechange", () => {
+        updatePipelineDiagnostic(
+          "audioContext",
+          `${context.state} at ${context.sampleRate} Hz; Whisper input is 16000 Hz`,
+        );
+        if (context.state === "suspended" && listening && audioContext === context) {
+          void resumeActiveAudioContext(context);
+        }
+      });
+      const contextReady = voiceCore.resumeAudioContext(context)
+        .then((sampleRate) => ({ sampleRate }), (error) => ({ error }));
+      failureStage = "audioWorklet";
+      const workletReady = context.audioWorklet.addModule("voice-capture-worklet.js")
+        .then(() => ({}), (error) => ({ error }));
+      updatePipelineDiagnostic("audioContext", `resuming at ${context.sampleRate} Hz`);
       const audioConstraints = {
         channelCount: 1,
         echoCancellation: true,
@@ -326,6 +470,7 @@ async function startCapture() {
         autoGainControl: true,
         ...(voiceSettings.microphoneDeviceId ? { deviceId: { exact: voiceSettings.microphoneDeviceId } } : {}),
       };
+      failureStage = "microphone";
       const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
       if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
         for (const track of stream.getTracks()) {
@@ -334,11 +479,47 @@ async function startCapture() {
         return;
       }
       mediaStream = stream;
+      const microphoneTrack = mediaStream.getAudioTracks()[0];
+      const inputSampleRate = microphoneTrack?.getSettings?.().sampleRate;
+      const inputName = microphoneTrack?.label || "default input";
+      updatePipelineDiagnostic(
+        "microphone",
+        `access granted: ${inputName}${inputSampleRate ? ` (${inputSampleRate} Hz)` : ""}`,
+      );
+      microphoneTrack?.addEventListener("mute", () => {
+        updatePipelineDiagnostic("microphone", "input track is muted");
+      });
+      microphoneTrack?.addEventListener("unmute", () => {
+        updatePipelineDiagnostic("microphone", microphoneTrack.label || "input track active");
+      });
+      microphoneTrack?.addEventListener("ended", () => {
+        if (generation === captureGeneration) {
+          reportVoiceError("microphone", new Error("The selected microphone track ended."));
+        }
+      });
       void refreshMicrophoneDevices().catch((error) => {
         microphonePicker.title = `Could not enumerate microphone devices: ${error.message}`;
       });
-      audioContext = new AudioContext({ sampleRate: voiceCore.TARGET_SAMPLE_RATE });
-      await audioContext.audioWorklet.addModule("voice-capture-worklet.js");
+      failureStage = "audioContext";
+      const contextStatus = await contextReady;
+      if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
+        await stopCapture("Sleep", muted ? "Microphone is muted." : "Listening is paused.");
+        return;
+      }
+      if (contextStatus.error) {
+        throw contextStatus.error;
+      }
+      const actualSampleRate = contextStatus.sampleRate;
+      updatePipelineDiagnostic(
+        "audioContext",
+        `running at ${actualSampleRate} Hz; Whisper input is 16000 Hz`,
+      );
+      failureStage = "audioWorklet";
+      const workletStatus = await workletReady;
+      if (workletStatus.error) {
+        throw workletStatus.error;
+      }
+      updatePipelineDiagnostic("audioWorklet", "ready; waiting for microphone frames");
       if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
         await stopCapture("Sleep", muted ? "Microphone is muted." : "Listening is paused.");
         return;
@@ -352,34 +533,75 @@ async function startCapture() {
       const mutedOutput = audioContext.createGain();
       mutedOutput.gain.value = 0;
       segmenter = new voiceCore.VoiceActivitySegmenter({
-        sampleRate: voiceCore.TARGET_SAMPLE_RATE,
+        sampleRate: context.sampleRate,
         maximumMs: 30000,
       });
       bargeInDetector = new voiceCore.VoiceOnsetDetector({
-        sampleRate: voiceCore.TARGET_SAMPLE_RATE,
+        sampleRate: context.sampleRate,
         minimumMs: 180,
+      });
+      let resolveFirstFrame;
+      const firstAudioFrame = new Promise((resolve) => {
+        resolveFirstFrame = resolve;
+        cancelPendingFrameCheck = () => resolve(false);
       });
       audioNode.port.onmessage = ({ data }) => {
         const input = data instanceof Float32Array ? data : new Float32Array(data);
-        const samples = voiceCore.resampleTo16k(input, audioContext.sampleRate);
+        if (generation !== captureGeneration || audioContext !== context || input.length === 0) {
+          return;
+        }
+        audioFramesReceived += 1;
+        capturedSamples += input.length;
+        if (resolveFirstFrame) {
+          resolveFirstFrame(true);
+          resolveFirstFrame = undefined;
+          cancelPendingFrameCheck = undefined;
+        }
+        const now = Date.now();
+        if (now - lastPipelineRenderAt >= 500) {
+          lastPipelineRenderAt = now;
+          updatePipelineDiagnostic(
+            "audioWorklet",
+            `receiving ${audioFramesReceived} frames at ${context.sampleRate} Hz`,
+          );
+          updatePipelineDiagnostic(
+            "capturedAudio",
+            `${(capturedSamples / context.sampleRate).toFixed(2)} seconds received`,
+          );
+        }
         if (Date.now() - inputLevelUpdatedAt >= 125) {
           inputLevelUpdatedAt = Date.now();
-          updateInputLevel(samples);
+          updateInputLevel(input);
         }
         if (voiceState === "Speaking") {
-          if (!bargeInRequested && bargeInDetector.push(samples)) {
+          if (!bargeInRequested && bargeInDetector.push(input)) {
             bargeInRequested = true;
             void interruptCurrentSpeech().catch((error) => {
-              setVoiceState("Error", `Could not interrupt speech: ${error.message}`);
+              reportVoiceError("speech", new Error(`Could not interrupt speech: ${error.message}`));
             });
           }
         } else {
           bargeInDetector.reset();
           bargeInRequested = false;
         }
-        const utterance = segmenter.push(samples);
-        if (utterance && voiceCore.isSpeechLikeAudio(utterance)) {
-          queueTranscription(utterance);
+        const utterance = segmenter.push(input);
+        if (segmenter.active) {
+          updatePipelineDiagnostic(
+            "vad",
+            `speech detected; threshold ${segmenter.threshold.toFixed(3)} RMS`,
+          );
+        } else if (!utterance) {
+          updatePipelineDiagnostic("vad", "waiting for speech");
+        }
+        if (utterance) {
+          const durationSeconds = utterance.length / context.sampleRate;
+          updatePipelineDiagnostic("lastUtterance", `${durationSeconds.toFixed(2)} seconds`);
+          if (voiceCore.isSpeechLikeAudio(utterance, context.sampleRate)) {
+            updatePipelineDiagnostic("vad", "utterance accepted; sending to Whisper");
+            queueTranscription(utterance, context.sampleRate);
+          } else {
+            updatePipelineDiagnostic("vad", "utterance rejected by speech-quality filter");
+          }
         }
       };
       audioSource.connect(audioNode);
@@ -391,10 +613,27 @@ async function startCapture() {
       }
       listening = true;
       updateMicrophoneButtons();
+      failureStage = "audioWorklet";
+      const receivedAudioFrame = await Promise.race([
+        firstAudioFrame,
+        new Promise((resolve, reject) => {
+          frameTimeout = window.setTimeout(
+            () => reject(new Error("AudioWorklet received no microphone audio frames within 3 seconds.")),
+            3000,
+          );
+        }),
+      ]);
+      window.clearTimeout(frameTimeout);
+      if (!receivedAudioFrame || generation !== captureGeneration) {
+        return;
+      }
+      updatePipelineDiagnostic("audioWorklet", `receiving microphone frames (${audioFramesReceived} received)`);
       setVoiceState(activeConversation ? "Listening" : "Standby");
     } catch (error) {
       failed = true;
-      await stopCapture("Error", `Could not start the microphone: ${error.message}`);
+      window.clearTimeout(frameTimeout);
+      await stopCapture("Error", `Could not start voice capture: ${error.message}`);
+      reportVoiceError(failureStage, error);
     } finally {
       captureStartPromise = undefined;
       if (!failed && !listening && voiceSettings?.listeningEnabled && !muted && generation !== captureGeneration) {
@@ -461,24 +700,39 @@ function isPausePhrase(text) {
   ].some((phrase) => normalized.includes(phrase));
 }
 
-function queueTranscription(samples) {
+function queueTranscription(samples, sampleRate) {
   transcriptionQueue = transcriptionQueue.then(async () => {
     if (!listening) {
       return;
     }
+    let failed = false;
+    const durationSeconds = samples.length / sampleRate;
+    updatePipelineDiagnostic("transcription", `encoding ${durationSeconds.toFixed(2)} second utterance`);
     if (voiceState !== "Speaking") {
       setVoiceState("Thinking", "Checking speech locally.");
     }
     const transcriptionStartedAt = Date.now();
     try {
+      const mono16k = voiceCore.resampleTo16k(samples, sampleRate);
       const wav = voiceCore.encodeWav(
-        voiceCore.resampleTo16k(samples, voiceCore.TARGET_SAMPLE_RATE),
+        mono16k,
         voiceCore.TARGET_SAMPLE_RATE,
       );
+      updatePipelineDiagnostic(
+        "whisper",
+        `${voiceSettings?.whisperModel || "base"} model; ${sampleRate} Hz → 16000 Hz; ${wav.byteLength} byte WAV`,
+      );
+      updatePipelineDiagnostic("transcription", "transcribing offline with Whisper");
       const transcript = await window.jarvis.transcribeAudio(wav, transcriptionLanguage());
       latencyMetrics.transcriptionMs = Date.now() - transcriptionStartedAt;
       renderLatencyMetrics();
+      showRawTranscript(transcript);
+      updatePipelineDiagnostic(
+        "transcription",
+        transcript ? `transcript received in ${latencyMetrics.transcriptionMs} ms` : "Whisper returned no text",
+      );
       if (!voiceCore.isValidTranscript(transcript)) {
+        updatePipelineDiagnostic("wakeWord", "transcript rejected as empty, invalid, or hallucinated");
         return;
       }
       const now = Date.now();
@@ -487,21 +741,25 @@ function queueTranscription(samples) {
         lastAcceptedTranscript,
         now - lastAcceptedTranscriptAt,
       )) {
+        updatePipelineDiagnostic("transcription", "duplicate transcript suppressed");
         return;
       }
       if (await handleTranscript(transcript)) {
         lastAcceptedTranscript = transcript;
         lastAcceptedTranscriptAt = now;
+      } else {
+        updatePipelineDiagnostic("wakeWord", "wake phrase not detected; transcript ignored");
       }
     } catch (error) {
-      setVoiceState("Error", error.message);
+      failed = true;
+      reportVoiceError("transcription", error);
     } finally {
-      if (listening && voiceState !== "Speaking" && !processing) {
+      if (voiceCore.shouldRestoreListeningStatus({ listening, voiceState, processing, failed })) {
         setVoiceState(activeConversation ? "Listening" : "Standby");
       }
     }
   }).catch((error) => {
-    setVoiceState("Error", `Offline transcription queue failed: ${error.message}`);
+    reportVoiceError("transcription", new Error(`Offline transcription queue failed: ${error.message}`));
   });
 }
 
@@ -523,6 +781,12 @@ async function handleTranscript(transcript) {
   if (voiceState === "Speaking") {
     await interruptCurrentSpeech();
   }
+  const wake = voiceCore.extractWakeCommand(safeTranscript);
+  const hadActiveConversation = activeConversation;
+  updatePipelineDiagnostic(
+    "wakeWord",
+    wake.activated ? "wake phrase recognized" : hadActiveConversation ? "follow-up accepted in active session" : "wake phrase not detected",
+  );
   const resolvedCommand = voiceCore.resolveConversationCommand(safeTranscript, activeConversation);
   const command = resolvedCommand === null ? null : voiceCore.normalizeCommand(resolvedCommand);
   if (command === null) {
@@ -530,10 +794,12 @@ async function handleTranscript(transcript) {
   }
   if (isPausePhrase(command || safeTranscript)) {
     await window.jarvis.setVoiceControl("pause");
+    updatePipelineDiagnostic("wakeWord", "pause phrase recognized");
     return true;
   }
   refreshConversationSession();
   if (!command) {
+    updatePipelineDiagnostic("wakeWord", "wake phrase accepted; waiting for a command");
     await speak(languagePicker.value === "hi-IN" ? "जी, बताइए।" : "Yes, I'm listening.");
     return true;
   }
@@ -768,7 +1034,7 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
   const speechQueue = spoken ? new voiceCore.StreamingSpeechQueue({
     speak,
     interrupt: () => window.jarvis.interruptSpeech(),
-    onError: (error) => setVoiceState("Error", `Spoken response was stopped: ${error.message}`),
+    onError: (error) => reportVoiceError("speech", new Error(`Spoken response was stopped: ${error.message}`)),
   }) : undefined;
   activeSpeechQueue = speechQueue;
   processing = true;
@@ -777,7 +1043,9 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
   addMessage("user", originalTranscript || trimmed);
   setVoiceState("Thinking", "Working on your request.");
   try {
+    updatePipelineDiagnostic("backend", `${spoken ? "spoken" : "typed"} command sent to Go backend`);
     const result = await window.jarvis.executeCommand(trimmed, true);
+    updatePipelineDiagnostic("backend", "Go backend responded successfully");
     const reply = result.output || "Done.";
     finishAssistantStream(reply);
     if (spoken) {
@@ -788,6 +1056,9 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
     }
   } catch (error) {
     const interrupted = speechQueue?.cancelled === true;
+    if (!pipelineDiagnostics.backend.includes("responded successfully")) {
+      reportVoiceError("backend", error);
+    }
     await speechQueue?.cancel();
     discardAssistantStream();
     addMessage("assistant", error.message);
@@ -798,7 +1069,7 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
           ? `कमांड पूरा नहीं हो सका। ${error.message}`
           : error.message);
       } catch (speechError) {
-        setVoiceState("Error", `Speech output failed: ${speechError.message}`);
+        reportVoiceError("speech", speechError);
       }
     }
   } finally {
@@ -817,7 +1088,22 @@ async function executeCommand(command, spoken = true, originalTranscript = comma
 }
 
 microphoneButton.addEventListener("click", () => {
-  void window.jarvis.setVoiceControl(voiceSettings?.listeningEnabled ? "pause" : "resume")
+  const shouldResume = !voiceSettings?.listeningEnabled ||
+    (voiceState === "Error" && !listening && !captureStartPromise && !muted);
+  if (shouldResume) {
+    voiceSettings.listeningEnabled = true;
+    updateMicrophoneButtons();
+    if (!muted) {
+      void startCapture();
+    }
+    void persistVoiceSetting("listeningEnabled", true).catch(async (error) => {
+      voiceSettings.listeningEnabled = false;
+      await stopCapture("Error", error.message);
+      reportVoiceError("microphone", error);
+    });
+    return;
+  }
+  void window.jarvis.setVoiceControl("pause")
     .catch((error) => setVoiceState("Error", error.message));
 });
 
@@ -850,6 +1136,14 @@ window.jarvis.onVoiceAction((action) => {
     }
   }
   updateMicrophoneButtons();
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  reportVoiceError("renderer", event.reason || new Error("Unhandled renderer promise rejection."));
+});
+
+window.addEventListener("error", (event) => {
+  reportVoiceError("renderer", new Error(event.message || "Unhandled renderer error."));
 });
 
 commandForm.addEventListener("submit", (event) => {
@@ -904,7 +1198,10 @@ microphonePicker.addEventListener("change", () => {
   }).catch(() => {});
 });
 whisperModelPicker.addEventListener("change", () => {
-  void persistVoiceSetting("whisperModel", whisperModelPicker.value).then(renderVoiceSettings).catch(() => {
+  void persistVoiceSetting("whisperModel", whisperModelPicker.value).then((updated) => {
+    updateWhisperDiagnostics(updated.runtime);
+    renderVoiceSettings();
+  }).catch(() => {
     renderVoiceSettings();
   });
 });
@@ -958,9 +1255,13 @@ window.jarvis.onVoiceState((update) => {
   if (update?.state && update.state !== voiceState) {
     voiceState = update.state;
     statusText.textContent = update.state;
+    updateMicrophoneButtons();
     if (update.detail) {
       voiceDetail.textContent = update.detail;
     }
+  }
+  if (update?.state === "Speaking") {
+    updatePipelineDiagnostic("speech", "Windows SAPI reports active playback");
   }
   if (update?.state === "Speaking" && activeCommandStartedAt && latencyMetrics.firstSpeechMs === null) {
     latencyMetrics.firstSpeechMs = Date.now() - activeCommandStartedAt;
@@ -981,10 +1282,15 @@ window.jarvis.onAssistantDelta((update) => {
 });
 
 async function initializeDesktop() {
+  renderPipelineDiagnostics();
   try {
     voiceSettings = await window.jarvis.getVoiceSettings();
     muted = voiceSettings.muted;
     lastSuggestionAt = voiceSettings.lastSuggestionAt || 0;
+    updateWhisperDiagnostics();
+    if (voiceSettings.diagnosticLogPath) {
+      updatePipelineDiagnostic("diagnosticLog", voiceSettings.diagnosticLogPath);
+    }
     renderVoiceSettings();
     renderLatencyMetrics();
     try {
