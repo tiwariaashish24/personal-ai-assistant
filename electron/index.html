@@ -51,8 +51,60 @@
           </button>
           <button id="mute-button" class="mute-button" type="button">Mute microphone</button>
         </div>
+        <label class="microphone-picker" for="microphone-device">
+          <span>Input device</span>
+          <select id="microphone-device">
+            <option value="">System default</option>
+          </select>
+        </label>
+        <div class="input-level">
+          <label for="input-level-meter">Input level</label>
+          <meter id="input-level-meter" min="0" max="1" value="0"></meter>
+          <output id="input-level-label">-inf dBFS</output>
+        </div>
         <p id="microphone-privacy" class="hint">Microphone starts only after local voice setup and permission.</p>
       </section>
+
+      <details class="settings-panel">
+        <summary>Voice and communication settings</summary>
+        <div class="settings-grid">
+          <label for="whisper-model">Whisper model</label>
+          <select id="whisper-model">
+            <option value="base">Whisper Base</option>
+            <option value="small">Whisper Small</option>
+          </select>
+          <label class="settings-toggle" for="proactive-enabled">
+            <input id="proactive-enabled" type="checkbox" checked />
+            Context-aware suggestions
+          </label>
+          <label class="settings-toggle" for="dnd-enabled">
+            <input id="dnd-enabled" type="checkbox" />
+            Do not disturb
+          </label>
+          <label class="settings-toggle" for="task-announcements">
+            <input id="task-announcements" type="checkbox" checked />
+            Speak task completions
+          </label>
+          <label class="settings-toggle" for="reminder-announcements">
+            <input id="reminder-announcements" type="checkbox" checked />
+            Speak reminders
+          </label>
+          <label for="quiet-hours-start">Quiet hours start</label>
+          <input id="quiet-hours-start" type="time" value="22:00" />
+          <label for="quiet-hours-end">Quiet hours end</label>
+          <input id="quiet-hours-end" type="time" value="08:00" />
+          <label for="proactive-cooldown">Suggestion cooldown (minutes)</label>
+          <input id="proactive-cooldown" type="number" min="1" max="1440" value="30" />
+        </div>
+        <p class="hint">Quiet hours and do-not-disturb keep task and reminder updates visible but silent.</p>
+      </details>
+
+      <details class="settings-panel diagnostics-panel">
+        <summary>Performance diagnostics</summary>
+        <button id="diagnostics-button" class="workspace-button" type="button">Measure now</button>
+        <pre id="diagnostics-output" class="diagnostics-output">Diagnostics run only when requested.</pre>
+        <pre id="latency-output" class="diagnostics-output">Voice latency: not measured</pre>
+      </details>
 
       <section class="command-panel" aria-label="Command input">
         <form id="command-form">

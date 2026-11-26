@@ -1,21 +1,37 @@
 param(
   [string]$InstallDirectory = (Join-Path $env:APPDATA "JARVIS\voice"),
+  [ValidateSet("Base", "Small", "Both")]
+  [string]$Model = "Base",
   [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
 $whisperVersion = "v1.9.6"
-$modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true"
+$modelSpecs = @{
+  base = @{
+    File = "ggml-base.bin"
+    Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true"
+    MinimumBytes = 100000000
+    MaximumBytes = 200000000
+    ApproximateMiB = 142
+  }
+  small = @{
+    File = "ggml-small.bin"
+    Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true"
+    MinimumBytes = 400000000
+    MaximumBytes = 600000000
+    ApproximateMiB = 466
+  }
+}
+$selectedModels = if ($Model -eq "Both") { @("base", "small") } else { @($Model.ToLowerInvariant()) }
 
 if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
   throw "APPDATA is not set. Run this installer on Windows."
 }
 $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("jarvis-whisper-" + [guid]::NewGuid().ToString("N"))
-$modelPath = Join-Path $InstallDirectory "ggml-base.bin"
 $binaryPath = Join-Path $InstallDirectory "whisper-cli.exe"
 $localReleaseDirectory = Join-Path $PSScriptRoot "..\whisper\Release"
 $localBinary = Join-Path $localReleaseDirectory "whisper-cli.exe"
-$localModel = Join-Path $PSScriptRoot "..\whisper\models\ggml-base.bin"
 
 function Test-WhisperExecutable([string]$Path) {
   $stdoutPath = Join-Path $env:TEMP ("jarvis-whisper-" + [guid]::NewGuid().ToString("N") + ".out")
@@ -35,11 +51,19 @@ function Test-WhisperExecutable([string]$Path) {
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
 
 try {
-  $modelInfo = Get-Item $modelPath -ErrorAction SilentlyContinue
   $binaryInfo = Get-Item $binaryPath -ErrorAction SilentlyContinue
-  if (-not $Force -and $modelInfo -and $modelInfo.Length -ge 100000000 -and $binaryInfo) {
+  $modelsInstalled = $true
+  foreach ($modelName in $selectedModels) {
+    $spec = $modelSpecs[$modelName]
+    $modelPath = Join-Path $InstallDirectory $spec.File
+    $modelInfo = Get-Item $modelPath -ErrorAction SilentlyContinue
+    if (-not $modelInfo -or $modelInfo.Length -lt $spec.MinimumBytes -or $modelInfo.Length -gt $spec.MaximumBytes) {
+      $modelsInstalled = $false
+    }
+  }
+  if (-not $Force -and $modelsInstalled -and $binaryInfo) {
     Test-WhisperExecutable $binaryPath
-    Write-Output "Whisper.cpp and the multilingual base model are already installed in $InstallDirectory"
+    Write-Output "Whisper.cpp and the requested multilingual model(s) are already installed in $InstallDirectory"
     exit 0
   }
 
@@ -94,27 +118,43 @@ try {
     }
   }
 
-  $existingModel = Get-Item $modelPath -ErrorAction SilentlyContinue
-  if ($Force -or -not $existingModel -or $existingModel.Length -lt 100000000) {
-    if (-not $Force -and (Test-Path $localModel -PathType Leaf) -and (Get-Item $localModel).Length -ge 100000000) {
-      Write-Output "Installing the local multilingual Whisper base model..."
-      Copy-Item $localModel "$modelPath.new" -Force
-      Move-Item "$modelPath.new" $modelPath -Force
-    } else {
-      $downloadPath = Join-Path $workDirectory "ggml-base.bin"
-      Write-Output "Downloading the multilingual Whisper base model (about 142 MiB)..."
-      Invoke-WebRequest -UseBasicParsing -Uri $modelUrl -OutFile $downloadPath
-      $downloadedModel = Get-Item $downloadPath
-      if ($downloadedModel.Length -lt 100000000 -or $downloadedModel.Length -gt 200000000) {
-        throw "The downloaded Whisper model has an unexpected size ($($downloadedModel.Length) bytes)."
-      }
-      Move-Item $downloadPath $modelPath -Force
+  foreach ($modelName in $selectedModels) {
+    $spec = $modelSpecs[$modelName]
+    $modelPath = Join-Path $InstallDirectory $spec.File
+    $existingModel = Get-Item $modelPath -ErrorAction SilentlyContinue
+    if (-not $Force -and $existingModel -and
+        $existingModel.Length -ge $spec.MinimumBytes -and
+        $existingModel.Length -le $spec.MaximumBytes) {
+      continue
     }
+
+    $localModel = Join-Path $PSScriptRoot "..\whisper\models\$($spec.File)"
+    if (-not $Force -and (Test-Path $localModel -PathType Leaf)) {
+      $localInfo = Get-Item $localModel
+      if ($localInfo.Length -ge $spec.MinimumBytes -and $localInfo.Length -le $spec.MaximumBytes) {
+        Write-Output "Installing the local multilingual Whisper $modelName model..."
+        Copy-Item $localModel "$modelPath.new" -Force
+        Move-Item "$modelPath.new" $modelPath -Force
+        continue
+      }
+    }
+
+    $downloadPath = Join-Path $workDirectory $spec.File
+    $approximateMiB = $spec.ApproximateMiB
+    Write-Output "Downloading the multilingual Whisper $modelName model (about $approximateMiB MiB)..."
+    Invoke-WebRequest -UseBasicParsing -Uri $spec.Url -OutFile $downloadPath
+    $downloadedModel = Get-Item $downloadPath
+    if ($downloadedModel.Length -lt $spec.MinimumBytes -or $downloadedModel.Length -gt $spec.MaximumBytes) {
+      throw "The downloaded Whisper $modelName model has an unexpected size ($($downloadedModel.Length) bytes)."
+    }
+    Move-Item $downloadPath $modelPath -Force
   }
 
   Test-WhisperExecutable $binaryPath
   Write-Output "Whisper.cpp is ready: $binaryPath"
-  Write-Output "Multilingual model is ready: $modelPath"
+  foreach ($modelName in $selectedModels) {
+    Write-Output "Multilingual model is ready: $(Join-Path $InstallDirectory $modelSpecs[$modelName].File)"
+  }
 } finally {
   if (Test-Path $workDirectory) {
     Remove-Item -LiteralPath $workDirectory -Recurse -Force

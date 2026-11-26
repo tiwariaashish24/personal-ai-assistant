@@ -7,14 +7,387 @@
   }
 })(globalThis, () => {
   const TARGET_SAMPLE_RATE = 16000;
+  const VOICE_PREFERENCE_DEFAULTS = Object.freeze({
+    startAtLogin: true,
+    listeningEnabled: true,
+    muted: false,
+    whisperModel: "base",
+    microphoneDeviceId: "",
+    proactiveSuggestionsEnabled: true,
+    doNotDisturb: false,
+    quietHoursStart: "22:00",
+    quietHoursEnd: "08:00",
+    proactiveCooldownMinutes: 30,
+    lastSuggestionAt: 0,
+    announceTaskCompletions: true,
+    announceReminders: true,
+  });
 
   function normalizeSpeechText(value) {
-    return String(value || "")
+    return sanitizeTranscript(value)
       .normalize("NFKC")
       .toLocaleLowerCase()
       .replace(/[.,!?،؛؟।]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+  function sanitizeTranscript(value) {
+    return String(value || "")
+      .normalize("NFKC")
+      .replace(/[\u0000-\u001f\u007f-\u009f\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim();
+  }
+
+  function normalizeCommand(value) {
+    return sanitizeTranscript(value);
+  }
+
+  function isValidTranscript(value) {
+    const text = sanitizeTranscript(value);
+    const words = text.match(/[\p{L}\p{N}]+/gu) || [];
+    if (!text || text.length > 1000 || words.length === 0 || words.length > 100) {
+      return false;
+    }
+    if (/^(?:thanks?\s+for\s+watching|please\s+subscribe|subtitles?\s+by)\b/iu.test(text)) {
+      return false;
+    }
+    for (let size = 1; size <= Math.min(4, Math.floor(words.length / 3)); size += 1) {
+      if (words.length % size !== 0 || words.length / size < 3) {
+        continue;
+      }
+      const pattern = words.slice(0, size).join(" ").toLocaleLowerCase();
+      if (Array.from({ length: words.length / size }, (_, index) =>
+        words.slice(index * size, (index + 1) * size).join(" ").toLocaleLowerCase(),
+      ).every((part) => part === pattern)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isDuplicateTranscript(value, previousValue, elapsedMs, windowMs = 2500) {
+    const current = normalizeSpeechText(value);
+    return Boolean(current && current === normalizeSpeechText(previousValue) &&
+      Number.isFinite(elapsedMs) && elapsedMs >= 0 && elapsedMs < windowMs);
+  }
+
+  function normalizeVoicePreferences(saved = {}) {
+    const preferences = { ...VOICE_PREFERENCE_DEFAULTS };
+    for (const key of ["startAtLogin", "listeningEnabled", "muted", "proactiveSuggestionsEnabled",
+      "doNotDisturb", "announceTaskCompletions", "announceReminders"]) {
+      if (typeof saved[key] === "boolean") {
+        preferences[key] = saved[key];
+      }
+    }
+    if (saved.whisperModel === "base" || saved.whisperModel === "small") {
+      preferences.whisperModel = saved.whisperModel;
+    }
+    if (typeof saved.microphoneDeviceId === "string" && saved.microphoneDeviceId.length <= 512) {
+      preferences.microphoneDeviceId = saved.microphoneDeviceId;
+    }
+    for (const key of ["quietHoursStart", "quietHoursEnd"]) {
+      if (typeof saved[key] === "string" && /^([01]\d|2[0-3]):[0-5]\d$/u.test(saved[key])) {
+        preferences[key] = saved[key];
+      }
+    }
+    if (Number.isInteger(saved.proactiveCooldownMinutes) &&
+        saved.proactiveCooldownMinutes >= 1 && saved.proactiveCooldownMinutes <= 1440) {
+      preferences.proactiveCooldownMinutes = saved.proactiveCooldownMinutes;
+    }
+    if (Number.isFinite(saved.lastSuggestionAt) && saved.lastSuggestionAt >= 0) {
+      preferences.lastSuggestionAt = saved.lastSuggestionAt;
+    }
+    return preferences;
+  }
+
+  function updateVoicePreference(current, key, value) {
+    if (!Object.hasOwn(VOICE_PREFERENCE_DEFAULTS, key)) {
+      throw new Error("Unsupported JARVIS voice preference.");
+    }
+    const next = normalizeVoicePreferences({ ...current, [key]: value });
+    if (next[key] !== value) {
+      throw new Error(`Invalid value for JARVIS preference ${key}.`);
+    }
+    return next;
+  }
+
+  function isWithinQuietHours(date, start, end) {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/u.test(start) ||
+        !/^([01]\d|2[0-3]):[0-5]\d$/u.test(end) || start === end) {
+      return false;
+    }
+    const currentMinutes = date.getHours() * 60 + date.getMinutes();
+    const toMinutes = (time) => Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
+    const startMinutes = toMinutes(start);
+    const endMinutes = toMinutes(end);
+    return startMinutes < endMinutes
+      ? currentMinutes >= startMinutes && currentMinutes < endMinutes
+      : currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  }
+
+  function shouldSpeakProactive(preferences, kind, now = new Date(), lastSuggestionAt = 0) {
+    const date = now instanceof Date ? now : new Date(now);
+    if (preferences.doNotDisturb ||
+        isWithinQuietHours(date, preferences.quietHoursStart, preferences.quietHoursEnd)) {
+      return false;
+    }
+    if (kind === "reminder") {
+      return preferences.announceReminders;
+    }
+    if (kind === "task") {
+      return preferences.announceTaskCompletions;
+    }
+    if (kind === "suggestion") {
+      return preferences.proactiveSuggestionsEnabled &&
+        date.getTime() - lastSuggestionAt >= preferences.proactiveCooldownMinutes * 60_000;
+    }
+    return false;
+  }
+
+  function completionSuggestion(task) {
+    const description = sanitizeTranscript(task?.description).toLocaleLowerCase();
+    const output = sanitizeTranscript(task?.output).toLocaleLowerCase();
+    if (description.startsWith("reminder:") ||
+        !/\b(created|saved|updated|generated|completed|ready)\b/u.test(output)) {
+      return "";
+    }
+    return "Would you like me to review or open the completed result?";
+  }
+
+  function analyzeAudio(samples) {
+    if (!(samples instanceof Float32Array) || samples.length === 0) {
+      throw new TypeError("audio samples are required");
+    }
+    let sumSquares = 0;
+    let peak = 0;
+    let clippedSamples = 0;
+    let zeroCrossings = 0;
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = samples[index];
+      sumSquares += sample * sample;
+      peak = Math.max(peak, Math.abs(sample));
+      if (Math.abs(sample) >= 0.995) {
+        clippedSamples += 1;
+      }
+      if (index > 0 && ((sample >= 0) !== (samples[index - 1] >= 0))) {
+        zeroCrossings += 1;
+      }
+    }
+    const rms = Math.sqrt(sumSquares / samples.length);
+    return {
+      rms,
+      peak,
+      decibels: rms > 0 ? 20 * Math.log10(rms) : -Infinity,
+      clippedRatio: clippedSamples / samples.length,
+      zeroCrossingRate: zeroCrossings / samples.length,
+    };
+  }
+
+  function isSpeechLikeAudio(samples, sampleRate = TARGET_SAMPLE_RATE) {
+    if (!(samples instanceof Float32Array) || sampleRate <= 0 ||
+        samples.length < sampleRate * 0.25) {
+      return false;
+    }
+    const stats = analyzeAudio(samples);
+    if (stats.rms < 0.008 || stats.peak < 0.02 || stats.clippedRatio > 0.12 ||
+        stats.zeroCrossingRate < 0.002 || stats.zeroCrossingRate > 0.48) {
+      return false;
+    }
+    const frameSize = Math.max(80, Math.floor(sampleRate * 0.01));
+    const energies = [];
+    for (let offset = 0; offset + frameSize <= samples.length; offset += frameSize) {
+      let sumSquares = 0;
+      for (let index = offset; index < offset + frameSize; index += 1) {
+        sumSquares += samples[index] * samples[index];
+      }
+      const frameRms = Math.sqrt(sumSquares / frameSize);
+      if (frameRms >= 0.006) {
+        energies.push(frameRms);
+      }
+    }
+    if (energies.length < 8) {
+      return false;
+    }
+    const mean = energies.reduce((total, value) => total + value, 0) / energies.length;
+    const variance = energies.reduce((total, value) => total + (value - mean) ** 2, 0) / energies.length;
+    return mean > 0 && Math.sqrt(variance) / mean >= 0.006;
+  }
+
+  class StreamingSpeechQueue {
+    constructor({
+      speak,
+      interrupt = () => {},
+      onFirstSpeak = () => {},
+      onError = () => {},
+      maxSentences = 12,
+      maxQueuedCharacters = 2400,
+      maxSentenceCharacters = 320,
+    } = {}) {
+      if (typeof speak !== "function") {
+        throw new TypeError("a speech function is required");
+      }
+      this.speak = speak;
+      this.interrupt = interrupt;
+      this.onFirstSpeak = onFirstSpeak;
+      this.onError = onError;
+      this.maxSentences = maxSentences;
+      this.maxQueuedCharacters = maxQueuedCharacters;
+      this.maxSentenceCharacters = maxSentenceCharacters;
+      this.buffer = "";
+      this.queue = [];
+      this.pumping = null;
+      this.active = false;
+      this.closed = false;
+      this.cancelled = false;
+      this.hasContent = false;
+      this.firstSpeakSent = false;
+    }
+
+    push(delta) {
+      if (this.closed || this.cancelled) {
+        return false;
+      }
+      if (typeof delta !== "string") {
+        throw new TypeError("streamed speech must be text");
+      }
+      this.buffer += delta;
+      this.hasContent = this.hasContent || Boolean(delta.trim());
+      this.extractSentences(false);
+      if (this.queue.length + (this.active ? 1 : 0) > this.maxSentences ||
+          this.buffer.length + this.queue.reduce((total, sentence) => total + sentence.length, 0) >
+            this.maxQueuedCharacters) {
+        this.fail(new Error("Speech queue limit reached; remaining text is available on screen."));
+        return false;
+      }
+      this.pump();
+      return true;
+    }
+
+    async finish() {
+      if (this.cancelled) {
+        return;
+      }
+      this.closed = true;
+      const remaining = this.buffer.trim();
+      this.buffer = "";
+      if (remaining) {
+        this.queue.push(remaining);
+      }
+      if (this.queue.length + (this.active ? 1 : 0) > this.maxSentences ||
+          this.queue.reduce((total, sentence) => total + sentence.length, 0) >
+            this.maxQueuedCharacters) {
+        this.fail(new Error("Speech queue limit reached; remaining text is available on screen."));
+        return;
+      }
+      this.pump();
+      while (this.pumping) {
+        await this.pumping;
+      }
+    }
+
+    cancel() {
+      if (this.cancelled) {
+        return Promise.resolve(false);
+      }
+      this.cancelled = true;
+      this.closed = true;
+      this.buffer = "";
+      this.queue = [];
+      if (this.active) {
+        return Promise.resolve(this.interrupt())
+          .then(() => true)
+          .catch((error) => {
+            this.onError(error);
+            return false;
+          });
+      }
+      return Promise.resolve(true);
+    }
+
+    extractSentences(force) {
+      while (this.buffer) {
+        let boundary = -1;
+        for (let index = 0; index < this.buffer.length; index += 1) {
+          if (!/[.!?。？！।॥]/u.test(this.buffer[index])) {
+            continue;
+          }
+          let end = index + 1;
+          while (/["'”’)\]]/u.test(this.buffer[end] || "")) {
+            end += 1;
+          }
+          if (end < this.buffer.length && /\s/u.test(this.buffer[end])) {
+            boundary = end;
+            break;
+          }
+          if (force && end === this.buffer.length) {
+            boundary = end;
+            break;
+          }
+        }
+        if (boundary !== -1) {
+          const sentence = this.buffer.slice(0, boundary).trim();
+          this.buffer = this.buffer.slice(boundary).trimStart();
+          if (sentence) {
+            this.queue.push(sentence);
+          }
+          continue;
+        }
+        if (this.buffer.length <= this.maxSentenceCharacters) {
+          break;
+        }
+        let splitAt = this.buffer.lastIndexOf(" ", this.maxSentenceCharacters);
+        if (splitAt <= 0) {
+          splitAt = this.maxSentenceCharacters;
+        }
+        const sentence = this.buffer.slice(0, splitAt).trim();
+        this.buffer = this.buffer.slice(splitAt).trimStart();
+        if (sentence) {
+          this.queue.push(sentence);
+        }
+      }
+    }
+
+    pump() {
+      if (this.pumping || this.cancelled || this.queue.length === 0) {
+        return;
+      }
+      const run = async () => {
+        while (this.queue.length > 0 && !this.cancelled) {
+          const sentence = this.queue.shift();
+          this.active = true;
+          if (!this.firstSpeakSent) {
+            this.firstSpeakSent = true;
+            this.onFirstSpeak();
+          }
+          try {
+            await this.speak(sentence);
+          } catch (error) {
+            this.fail(error);
+          } finally {
+            this.active = false;
+          }
+        }
+      };
+      const pumping = run().finally(() => {
+        if (this.pumping === pumping) {
+          this.pumping = null;
+          if (this.queue.length > 0 && !this.cancelled) {
+            this.pump();
+          }
+        }
+      });
+      this.pumping = pumping;
+    }
+
+    fail(error) {
+      if (this.cancelled) {
+        return;
+      }
+      this.onError(error);
+      this.cancel();
+    }
   }
 
   function extractWakeCommand(value) {
@@ -233,13 +606,25 @@
 
   return {
     TARGET_SAMPLE_RATE,
+    VOICE_PREFERENCE_DEFAULTS,
+    StreamingSpeechQueue,
     VoiceOnsetDetector,
     VoiceActivitySegmenter,
+    analyzeAudio,
+    completionSuggestion,
     encodeWav,
     extractWakeCommand,
+    isDuplicateTranscript,
+    isSpeechLikeAudio,
+    isValidTranscript,
+    isWithinQuietHours,
+    normalizeCommand,
+    normalizeVoicePreferences,
     normalizeSpeechText,
     resolveConversationCommand,
     resemblesEcho,
     resampleTo16k,
+    shouldSpeakProactive,
+    updateVoicePreference,
   };
 });

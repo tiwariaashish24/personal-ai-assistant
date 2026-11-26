@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld("jarvis", {
   getIntegrations: () => ipcRenderer.invoke("jarvis:integrations"),
   getTasks: () => ipcRenderer.invoke("jarvis:tasks"),
   getVoiceSettings: () => ipcRenderer.invoke("jarvis:voice-settings"),
+  setVoiceSetting: (key, value) => ipcRenderer.invoke("jarvis:voice-setting", key, value),
+  getDiagnostics: () => ipcRenderer.invoke("jarvis:diagnostics"),
   setVoiceControl: (action) => ipcRenderer.invoke("jarvis:voice-control", action),
   transcribeAudio: (audio, language) => ipcRenderer.invoke("jarvis:voice-transcribe", audio, language),
   speak: (text) => ipcRenderer.invoke("jarvis:voice-speak", text),

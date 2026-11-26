@@ -3,6 +3,10 @@ const microphoneButton = document.querySelector("#microphone-button");
 const microphoneLabel = document.querySelector("#microphone-label");
 const muteButton = document.querySelector("#mute-button");
 const languagePicker = document.querySelector("#language");
+const microphonePicker = document.querySelector("#microphone-device");
+const whisperModelPicker = document.querySelector("#whisper-model");
+const inputLevelMeter = document.querySelector("#input-level-meter");
+const inputLevelLabel = document.querySelector("#input-level-label");
 const statusText = document.querySelector("#status");
 const voiceDetail = document.querySelector("#voice-detail");
 const conversation = document.querySelector("#conversation");
@@ -13,6 +17,9 @@ const microphonePrivacy = document.querySelector("#microphone-privacy");
 const microphoneIndicator = document.querySelector("#microphone-indicator");
 const integrationsList = document.querySelector("#integrations-list");
 const backgroundTasks = document.querySelector("#background-tasks");
+const diagnosticsOutput = document.querySelector("#diagnostics-output");
+const diagnosticsButton = document.querySelector("#diagnostics-button");
+const latencyOutput = document.querySelector("#latency-output");
 
 let voiceSettings;
 let voiceState = "Offline";
@@ -33,6 +40,17 @@ let transcriptionQueue = Promise.resolve();
 let commandQueue = Promise.resolve();
 let currentSpokenText = "";
 let spokenEchoWindowUntil = 0;
+let activeSpeechQueue;
+let lastAcceptedTranscript = "";
+let lastAcceptedTranscriptAt = 0;
+let lastSuggestionAt = 0;
+let inputLevelUpdatedAt = 0;
+let activeCommandStartedAt = 0;
+const latencyMetrics = {
+  transcriptionMs: null,
+  firstAiTokenMs: null,
+  firstSpeechMs: null,
+};
 let knownTaskStates = new Map();
 let taskPollTimer;
 let taskBaselineLoaded = false;
@@ -121,6 +139,16 @@ async function speak(text) {
   }
 }
 
+async function interruptCurrentSpeech() {
+  currentSpokenText = "";
+  spokenEchoWindowUntil = 0;
+  if (activeSpeechQueue) {
+    await activeSpeechQueue.cancel();
+    return;
+  }
+  await window.jarvis.interruptSpeech();
+}
+
 function updateMicrophoneButtons() {
   microphoneLabel.textContent = voiceSettings?.listeningEnabled ? "Pause listening" : "Resume listening";
   muteButton.textContent = muted ? "Unmute microphone" : "Mute microphone";
@@ -134,7 +162,108 @@ function transcriptionLanguage() {
   if (languagePicker.value === "hi-IN") {
     return "hi";
   }
-  return "auto";
+  return voiceSettings?.hinglishLanguage || "hi";
+}
+
+function updateInputLevel(samples) {
+  const { rms, decibels } = voiceCore.analyzeAudio(samples);
+  inputLevelMeter.value = Math.min(1, rms * 8);
+  inputLevelLabel.textContent = Number.isFinite(decibels) ? `${Math.round(decibels)} dBFS` : "-inf dBFS";
+}
+
+async function refreshMicrophoneDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    microphonePicker.disabled = true;
+    microphonePicker.replaceChildren(new Option("Microphone selection unavailable", ""));
+    return;
+  }
+  const devices = (await navigator.mediaDevices.enumerateDevices())
+    .filter((device) => device.kind === "audioinput");
+  microphonePicker.replaceChildren(new Option("System default", ""));
+  devices.forEach((device, index) => {
+    const option = new Option(device.label || `Microphone ${index + 1}`, device.deviceId);
+    microphonePicker.append(option);
+  });
+  const selected = voiceSettings?.microphoneDeviceId || "";
+  if (selected && !devices.some((device) => device.deviceId === selected)) {
+    const unavailable = new Option("Saved microphone unavailable", selected);
+    unavailable.disabled = true;
+    microphonePicker.append(unavailable);
+  }
+  microphonePicker.value = selected;
+  microphonePicker.disabled = false;
+}
+
+async function saveVoiceSetting(key, value) {
+  const updated = await window.jarvis.setVoiceSetting(key, value);
+  voiceSettings = { ...voiceSettings, ...updated };
+  return updated;
+}
+
+function renderLatencyMetrics() {
+  const format = (value) => value === null ? "not measured" : `${value} ms`;
+  latencyOutput.textContent = [
+    `Whisper transcription: ${format(latencyMetrics.transcriptionMs)}`,
+    `First AI text token: ${format(latencyMetrics.firstAiTokenMs)}`,
+    `First SAPI speech start: ${format(latencyMetrics.firstSpeechMs)}`,
+  ].join("\n");
+}
+
+function renderVoiceSettings() {
+  const models = voiceSettings?.whisperModels || {};
+  for (const option of whisperModelPicker.options) {
+    const installed = models[option.value];
+    option.disabled = installed === false;
+    if (option.value === "base") {
+      option.textContent = installed === false ? "Whisper Base (not installed)" : "Whisper Base";
+    } else if (option.value === "small") {
+      option.textContent = installed === false ? "Whisper Small (not installed)" : "Whisper Small";
+    }
+  }
+  whisperModelPicker.value = voiceSettings?.whisperModel || "base";
+  document.querySelector("#proactive-enabled").checked = voiceSettings?.proactiveSuggestionsEnabled !== false;
+  document.querySelector("#dnd-enabled").checked = voiceSettings?.doNotDisturb === true;
+  document.querySelector("#task-announcements").checked = voiceSettings?.announceTaskCompletions !== false;
+  document.querySelector("#reminder-announcements").checked = voiceSettings?.announceReminders !== false;
+  document.querySelector("#quiet-hours-start").value = voiceSettings?.quietHoursStart || "22:00";
+  document.querySelector("#quiet-hours-end").value = voiceSettings?.quietHoursEnd || "08:00";
+  document.querySelector("#proactive-cooldown").value = String(voiceSettings?.proactiveCooldownMinutes || 30);
+}
+
+async function persistVoiceSetting(key, value) {
+  try {
+    return await saveVoiceSetting(key, value);
+  } catch (error) {
+    setVoiceState("Error", `Could not save ${key}: ${error.message}`);
+    throw error;
+  }
+}
+
+async function runPerformanceDiagnostics() {
+  diagnosticsButton.disabled = true;
+  diagnosticsOutput.textContent = "Measuring system usage…";
+  try {
+    const metrics = await window.jarvis.getDiagnostics();
+    const gpu = metrics.gpu.available
+      ? `${metrics.gpu.name}: ${metrics.gpu.usedMiB}/${metrics.gpu.totalMiB} MiB VRAM, ${metrics.gpu.utilizationPercent}%`
+      : metrics.gpu.error;
+    const processes = metrics.appProcesses
+      .map((process) => `${process.type} PID ${process.pid}: ${process.cpuPercent}% CPU, ${process.workingSetMiB} MiB`)
+      .join("\n");
+    diagnosticsOutput.textContent = [
+      `Measured: ${metrics.measuredAt}`,
+      `System CPU: ${metrics.systemCpuPercent}%`,
+      `JARVIS main-process CPU: ${metrics.mainProcessCpuPercent}%`,
+      `System RAM: ${metrics.systemMemoryMiB.used}/${metrics.systemMemoryMiB.total} MiB used`,
+      `GPU: ${gpu}`,
+      "Electron processes:",
+      processes || "No Electron process metrics available.",
+    ].join("\n");
+  } catch (error) {
+    diagnosticsOutput.textContent = `Diagnostics failed: ${error.message}`;
+  } finally {
+    diagnosticsButton.disabled = false;
+  }
 }
 
 async function stopCapture(nextState = "Sleep", detail = "") {
@@ -164,6 +293,8 @@ async function stopCapture(nextState = "Sleep", detail = "") {
   }
   bargeInDetector = undefined;
   bargeInRequested = false;
+  inputLevelMeter.value = 0;
+  inputLevelLabel.textContent = "-inf dBFS";
   document.body.classList.remove("is-listening", "is-awake");
   updateMicrophoneButtons();
   setVoiceState(nextState, detail);
@@ -188,14 +319,14 @@ async function startCapture() {
   captureStartPromise = (async () => {
     let failed = false;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      const audioConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        ...(voiceSettings.microphoneDeviceId ? { deviceId: { exact: voiceSettings.microphoneDeviceId } } : {}),
+      };
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
       if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
         for (const track of stream.getTracks()) {
           track.stop();
@@ -203,6 +334,9 @@ async function startCapture() {
         return;
       }
       mediaStream = stream;
+      void refreshMicrophoneDevices().catch((error) => {
+        microphonePicker.title = `Could not enumerate microphone devices: ${error.message}`;
+      });
       audioContext = new AudioContext({ sampleRate: voiceCore.TARGET_SAMPLE_RATE });
       await audioContext.audioWorklet.addModule("voice-capture-worklet.js");
       if (generation !== captureGeneration || muted || !voiceSettings?.listeningEnabled) {
@@ -217,7 +351,10 @@ async function startCapture() {
       });
       const mutedOutput = audioContext.createGain();
       mutedOutput.gain.value = 0;
-      segmenter = new voiceCore.VoiceActivitySegmenter({ sampleRate: audioContext.sampleRate });
+      segmenter = new voiceCore.VoiceActivitySegmenter({
+        sampleRate: voiceCore.TARGET_SAMPLE_RATE,
+        maximumMs: 30000,
+      });
       bargeInDetector = new voiceCore.VoiceOnsetDetector({
         sampleRate: voiceCore.TARGET_SAMPLE_RATE,
         minimumMs: 180,
@@ -225,10 +362,14 @@ async function startCapture() {
       audioNode.port.onmessage = ({ data }) => {
         const input = data instanceof Float32Array ? data : new Float32Array(data);
         const samples = voiceCore.resampleTo16k(input, audioContext.sampleRate);
+        if (Date.now() - inputLevelUpdatedAt >= 125) {
+          inputLevelUpdatedAt = Date.now();
+          updateInputLevel(samples);
+        }
         if (voiceState === "Speaking") {
           if (!bargeInRequested && bargeInDetector.push(samples)) {
             bargeInRequested = true;
-            void window.jarvis.interruptSpeech().catch((error) => {
+            void interruptCurrentSpeech().catch((error) => {
               setVoiceState("Error", `Could not interrupt speech: ${error.message}`);
             });
           }
@@ -237,7 +378,7 @@ async function startCapture() {
           bargeInRequested = false;
         }
         const utterance = segmenter.push(samples);
-        if (utterance) {
+        if (utterance && voiceCore.isSpeechLikeAudio(utterance)) {
           queueTranscription(utterance);
         }
       };
@@ -300,9 +441,13 @@ function refreshConversationSession() {
   document.body.classList.add("is-awake");
   window.clearTimeout(conversationTimer);
   conversationTimer = window.setTimeout(() => {
+    if (processing || voiceState === "Speaking") {
+      refreshConversationSession();
+      return;
+    }
     activeConversation = false;
     document.body.classList.remove("is-awake");
-    if (listening && voiceState !== "Speaking" && !processing) {
+    if (listening) {
       setVoiceState("Standby");
     }
   }, 45000);
@@ -324,14 +469,29 @@ function queueTranscription(samples) {
     if (voiceState !== "Speaking") {
       setVoiceState("Thinking", "Checking speech locally.");
     }
+    const transcriptionStartedAt = Date.now();
     try {
       const wav = voiceCore.encodeWav(
         voiceCore.resampleTo16k(samples, voiceCore.TARGET_SAMPLE_RATE),
         voiceCore.TARGET_SAMPLE_RATE,
       );
       const transcript = await window.jarvis.transcribeAudio(wav, transcriptionLanguage());
-      if (transcript) {
-        await handleTranscript(transcript);
+      latencyMetrics.transcriptionMs = Date.now() - transcriptionStartedAt;
+      renderLatencyMetrics();
+      if (!voiceCore.isValidTranscript(transcript)) {
+        return;
+      }
+      const now = Date.now();
+      if (voiceCore.isDuplicateTranscript(
+        transcript,
+        lastAcceptedTranscript,
+        now - lastAcceptedTranscriptAt,
+      )) {
+        return;
+      }
+      if (await handleTranscript(transcript)) {
+        lastAcceptedTranscript = transcript;
+        lastAcceptedTranscriptAt = now;
       }
     } catch (error) {
       setVoiceState("Error", error.message);
@@ -345,38 +505,42 @@ function queueTranscription(samples) {
   });
 }
 
-function enqueueCommand(command, spoken = true) {
-  commandQueue = commandQueue.then(() => executeCommand(command, spoken));
+function enqueueCommand(command, spoken = true, originalTranscript = command) {
+  commandQueue = commandQueue.then(() => executeCommand(command, spoken, originalTranscript));
   return commandQueue;
 }
 
 async function handleTranscript(transcript) {
-  if (!listening || !transcript.trim()) {
-    return;
+  const preservedTranscript = String(transcript || "");
+  const safeTranscript = voiceCore.sanitizeTranscript(preservedTranscript);
+  if (!listening || !safeTranscript) {
+    return false;
   }
   const mayBeEcho = voiceState === "Speaking" || Date.now() < spokenEchoWindowUntil;
-  if (mayBeEcho && voiceCore.resemblesEcho(transcript, currentSpokenText)) {
-    return;
+  if (mayBeEcho && voiceCore.resemblesEcho(safeTranscript, currentSpokenText)) {
+    return false;
   }
   if (voiceState === "Speaking") {
-    await window.jarvis.interruptSpeech();
-    currentSpokenText = "";
-    spokenEchoWindowUntil = 0;
+    await interruptCurrentSpeech();
   }
-  const command = voiceCore.resolveConversationCommand(transcript, activeConversation);
+  const resolvedCommand = voiceCore.resolveConversationCommand(safeTranscript, activeConversation);
+  const command = resolvedCommand === null ? null : voiceCore.normalizeCommand(resolvedCommand);
   if (command === null) {
-    return;
+    return false;
   }
-  if (isPausePhrase(command || transcript)) {
+  if (isPausePhrase(command || safeTranscript)) {
     await window.jarvis.setVoiceControl("pause");
-    return;
+    return true;
   }
   refreshConversationSession();
   if (!command) {
     await speak(languagePicker.value === "hi-IN" ? "जी, बताइए।" : "Yes, I'm listening.");
-    return;
+    return true;
   }
-  await enqueueCommand(command);
+  void enqueueCommand(command, true, preservedTranscript).catch((error) => {
+    setVoiceState("Error", `Could not queue the spoken command: ${error.message}`);
+  });
+  return true;
 }
 
 function addIntegrationButton(container, action, account) {
@@ -514,10 +678,35 @@ async function pollBackgroundTasks() {
           (changedSinceObserved || (!previousStatus && createdDuringSession))) {
         announcedTaskIds.add(task.id);
         addMessage("assistant", task.output);
-        try {
-          await speak(task.output);
-        } catch (error) {
-          setVoiceState("Error", `Task notification speech failed: ${error.message}`);
+        const notificationKind = task.description?.toLowerCase().startsWith("reminder:")
+          ? "reminder"
+          : "task";
+        const communicationPreferences = voiceSettings || voiceCore.VOICE_PREFERENCE_DEFAULTS;
+        const canSpeakNotification = voiceCore.shouldSpeakProactive(
+          communicationPreferences,
+          notificationKind,
+          new Date(),
+          lastSuggestionAt,
+        );
+        if (canSpeakNotification && !processing && voiceState !== "Speaking" && !activeConversation) {
+          try {
+            await speak(task.output);
+          } catch (error) {
+            setVoiceState("Error", `Task notification speech failed: ${error.message}`);
+          }
+        }
+        const suggestion = voiceCore.completionSuggestion(task);
+        const canSuggest = suggestion && !processing && voiceState !== "Speaking" && !activeConversation &&
+          voiceCore.shouldSpeakProactive(communicationPreferences, "suggestion", new Date(), lastSuggestionAt);
+        if (canSuggest) {
+          lastSuggestionAt = Date.now();
+          void persistVoiceSetting("lastSuggestionAt", lastSuggestionAt).catch(() => {});
+          addMessage("assistant", suggestion);
+          try {
+            await speak(suggestion);
+          } catch (error) {
+            setVoiceState("Error", `Proactive suggestion speech failed: ${error.message}`);
+          }
         }
       } else if ((task.status === "failed" || task.status === "timed_out") &&
           !announcedTaskIds.has(task.id) &&
@@ -566,33 +755,44 @@ async function runIntegrationAction(action, account) {
   await loadIntegrations();
 }
 
-async function executeCommand(command, spoken = true) {
+async function executeCommand(command, spoken = true, originalTranscript = command) {
   const trimmed = command.trim();
   if (!trimmed) {
     return;
   }
 
+  activeCommandStartedAt = Date.now();
+  latencyMetrics.firstAiTokenMs = null;
+  latencyMetrics.firstSpeechMs = null;
+  renderLatencyMetrics();
+  const speechQueue = spoken ? new voiceCore.StreamingSpeechQueue({
+    speak,
+    interrupt: () => window.jarvis.interruptSpeech(),
+    onError: (error) => setVoiceState("Error", `Spoken response was stopped: ${error.message}`),
+  }) : undefined;
+  activeSpeechQueue = speechQueue;
   processing = true;
   discardAssistantStream();
   document.body.classList.remove("is-awake");
-  addMessage("user", trimmed);
+  addMessage("user", originalTranscript || trimmed);
   setVoiceState("Thinking", "Working on your request.");
   try {
     const result = await window.jarvis.executeCommand(trimmed, true);
     const reply = result.output || "Done.";
     finishAssistantStream(reply);
     if (spoken) {
-      try {
-        await speak(spokenReply(trimmed, reply));
-      } catch (error) {
-        setVoiceState("Error", `Speech output failed: ${error.message}`);
+      if (speechQueue && !speechQueue.hasContent && !speechQueue.cancelled) {
+        speechQueue.push(spokenReply(trimmed, reply));
       }
+      await speechQueue?.finish();
     }
   } catch (error) {
+    const interrupted = speechQueue?.cancelled === true;
+    await speechQueue?.cancel();
     discardAssistantStream();
     addMessage("assistant", error.message);
     setVoiceState("Error", "I couldn't complete that command.");
-    if (spoken) {
+    if (spoken && !interrupted) {
       try {
         await speak(languagePicker.value === "hi-IN"
           ? `कमांड पूरा नहीं हो सका। ${error.message}`
@@ -603,6 +803,13 @@ async function executeCommand(command, spoken = true) {
     }
   } finally {
     processing = false;
+    if (activeSpeechQueue === speechQueue) {
+      activeSpeechQueue = undefined;
+    }
+    activeCommandStartedAt = 0;
+    if (listening && activeConversation) {
+      refreshConversationSession();
+    }
     if (listening && voiceState !== "Speaking" && voiceState !== "Error") {
       setVoiceState(activeConversation ? "Listening" : "Standby");
     }
@@ -683,6 +890,54 @@ document.querySelector("#workspace-button").addEventListener("click", async () =
 document.querySelector("#integrations-button").addEventListener("click", () => {
   document.querySelector(".integrations-panel").scrollIntoView({ behavior: "smooth", block: "center" });
 });
+microphonePicker.addEventListener("change", () => {
+  const selected = microphonePicker.value;
+  void persistVoiceSetting("microphoneDeviceId", selected).then(async () => {
+    if (voiceSettings?.listeningEnabled && !muted) {
+      if (listening) {
+        await stopCapture();
+      }
+      await startCapture();
+    } else if (listening) {
+      await stopCapture();
+    }
+  }).catch(() => {});
+});
+whisperModelPicker.addEventListener("change", () => {
+  void persistVoiceSetting("whisperModel", whisperModelPicker.value).then(renderVoiceSettings).catch(() => {
+    renderVoiceSettings();
+  });
+});
+for (const [selector, key] of [
+  ["#proactive-enabled", "proactiveSuggestionsEnabled"],
+  ["#dnd-enabled", "doNotDisturb"],
+  ["#task-announcements", "announceTaskCompletions"],
+  ["#reminder-announcements", "announceReminders"],
+]) {
+  document.querySelector(selector).addEventListener("change", (event) => {
+    void persistVoiceSetting(key, event.currentTarget.checked).catch(() => {
+      renderVoiceSettings();
+    });
+  });
+}
+for (const [selector, key] of [
+  ["#quiet-hours-start", "quietHoursStart"],
+  ["#quiet-hours-end", "quietHoursEnd"],
+]) {
+  document.querySelector(selector).addEventListener("change", (event) => {
+    void persistVoiceSetting(key, event.currentTarget.value).catch(() => {
+      renderVoiceSettings();
+    });
+  });
+}
+document.querySelector("#proactive-cooldown").addEventListener("change", (event) => {
+  void persistVoiceSetting("proactiveCooldownMinutes", Number(event.currentTarget.value)).catch(() => {
+    renderVoiceSettings();
+  });
+});
+diagnosticsButton.addEventListener("click", () => {
+  void runPerformanceDiagnostics();
+});
 document.querySelector("#refresh-integrations").addEventListener("click", () => {
   void loadIntegrations();
 });
@@ -707,16 +962,36 @@ window.jarvis.onVoiceState((update) => {
       voiceDetail.textContent = update.detail;
     }
   }
+  if (update?.state === "Speaking" && activeCommandStartedAt && latencyMetrics.firstSpeechMs === null) {
+    latencyMetrics.firstSpeechMs = Date.now() - activeCommandStartedAt;
+    renderLatencyMetrics();
+  }
 });
 
 window.jarvis.onAssistantDelta((update) => {
-  appendAssistantDelta(update?.delta);
+  const delta = update?.delta;
+  appendAssistantDelta(delta);
+  if (typeof delta === "string" && activeCommandStartedAt && latencyMetrics.firstAiTokenMs === null) {
+    latencyMetrics.firstAiTokenMs = Date.now() - activeCommandStartedAt;
+    renderLatencyMetrics();
+  }
+  if (typeof delta === "string" && activeSpeechQueue) {
+    activeSpeechQueue.push(delta);
+  }
 });
 
 async function initializeDesktop() {
   try {
     voiceSettings = await window.jarvis.getVoiceSettings();
     muted = voiceSettings.muted;
+    lastSuggestionAt = voiceSettings.lastSuggestionAt || 0;
+    renderVoiceSettings();
+    renderLatencyMetrics();
+    try {
+      await refreshMicrophoneDevices();
+    } catch (error) {
+      setVoiceState("Error", `Could not enumerate microphones: ${error.message}`);
+    }
     updateMicrophoneButtons();
     if (voiceSettings.listeningEnabled && !muted) {
       await startCapture();
@@ -735,7 +1010,15 @@ async function initializeDesktop() {
   await pollBackgroundTasks();
   taskPollTimer = window.setInterval(() => {
     void pollBackgroundTasks();
-  }, 3000);
+  }, 5000);
+}
+
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    void refreshMicrophoneDevices().catch((error) => {
+      setVoiceState("Error", `Could not refresh microphone devices: ${error.message}`);
+    });
+  });
 }
 
 void initializeDesktop();

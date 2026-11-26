@@ -2,8 +2,10 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, session, Tray } 
 const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const fs = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const { VoiceRuntime } = require("./voice-runtime.cjs");
+const voiceCore = require("./voice-core.js");
 
 const backendDirectory = path.resolve(__dirname, "..", "backend");
 let mainWindow;
@@ -13,7 +15,8 @@ let pendingRequests = [];
 let tray;
 let voiceRuntime;
 let voiceAvailability = { available: false, message: "Voice runtime is not initialized." };
-let voicePreferences = { startAtLogin: true, listeningEnabled: true, muted: false };
+let voicePreferences = { ...voiceCore.VOICE_PREFERENCE_DEFAULTS };
+let savedWhisperModel = false;
 let voiceState = "Offline";
 let voiceDetail = "";
 let restartTimer;
@@ -130,11 +133,8 @@ function preferencesPath() {
 async function loadVoicePreferences() {
   try {
     const saved = JSON.parse(await fs.readFile(preferencesPath(), "utf8"));
-    voicePreferences = {
-      startAtLogin: saved.startAtLogin !== false,
-      listeningEnabled: saved.listeningEnabled !== false,
-      muted: saved.muted === true,
-    };
+    voicePreferences = voiceCore.normalizeVoicePreferences(saved);
+    savedWhisperModel = saved.whisperModel === "base" || saved.whisperModel === "small";
   } catch (error) {
     if (error.code !== "ENOENT") {
       console.error(`Could not load JARVIS preferences: ${error.message}`);
@@ -142,34 +142,57 @@ async function loadVoicePreferences() {
   }
 }
 
-async function saveVoicePreferences() {
+async function saveVoicePreferences({ strict = false } = {}) {
   try {
     await fs.mkdir(app.getPath("userData"), { recursive: true });
     await fs.writeFile(preferencesPath(), JSON.stringify(voicePreferences, null, 2), { mode: 0o600 });
   } catch (error) {
     console.error(`Could not save JARVIS preferences: ${error.message}`);
+    if (strict) {
+      throw new Error(`Could not save JARVIS preferences: ${error.message}`);
+    }
   }
   updateTrayMenu();
+}
+
+async function updateVoiceSetting(key, value) {
+  const previous = voicePreferences;
+  const next = voiceCore.updateVoicePreference(previous, key, value);
+  if (key === "whisperModel") {
+    await voiceRuntime.selectModel(value);
+  }
+  if (key === "startAtLogin") {
+    updateLoginStartup(value);
+  }
+  voicePreferences = next;
+  try {
+    await saveVoicePreferences({ strict: true });
+  } catch (error) {
+    voicePreferences = previous;
+    if (key === "whisperModel") {
+      await voiceRuntime.selectModel(previous.whisperModel);
+    }
+    if (key === "startAtLogin") {
+      updateLoginStartup(previous.startAtLogin);
+    }
+    throw error;
+  }
+  return { ...voicePreferences };
 }
 
 function setVoicePreference(action) {
   switch (action) {
     case "resume":
-      voicePreferences.listeningEnabled = true;
-      break;
+      return updateVoiceSetting("listeningEnabled", true);
     case "pause":
-      voicePreferences.listeningEnabled = false;
-      break;
+      return updateVoiceSetting("listeningEnabled", false);
     case "mute":
-      voicePreferences.muted = true;
-      break;
+      return updateVoiceSetting("muted", true);
     case "unmute":
-      voicePreferences.muted = false;
-      break;
+      return updateVoiceSetting("muted", false);
     default:
       throw new Error("Unsupported microphone action.");
   }
-  return saveVoicePreferences();
 }
 
 function checkTrustedWindow(event) {
@@ -368,6 +391,108 @@ function isTrustedWindow(event) {
   return mainWindow && event.sender === mainWindow.webContents;
 }
 
+function cpuTimesSnapshot() {
+  const cpus = os.cpus();
+  return cpus.reduce((totals, cpu) => {
+    for (const [mode, milliseconds] of Object.entries(cpu.times)) {
+      totals[mode] += milliseconds;
+    }
+    return totals;
+  }, { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 });
+}
+
+function queryNvidiaGpu() {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+    const child = spawn("nvidia-smi", [
+      "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+      "--format=csv,noheader,nounits",
+    ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish({ available: false, error: "nvidia-smi did not respond within 3 seconds." });
+    }, 3000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout = (stdout + chunk).slice(-4096);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk).slice(-4096);
+    });
+    child.once("error", (error) => {
+      finish({ available: false, error: `Could not query NVIDIA GPU metrics: ${error.message}` });
+    });
+    child.once("close", (code) => {
+      if (code !== 0) {
+        finish({
+          available: false,
+          error: `nvidia-smi exited with code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+        });
+        return;
+      }
+      const [name, totalMiB, usedMiB, utilizationPercent] = stdout.trim().split(",").map((value) => value.trim());
+      const values = [Number(totalMiB), Number(usedMiB), Number(utilizationPercent)];
+      if (!name || values.some((value) => !Number.isFinite(value))) {
+        finish({ available: false, error: "nvidia-smi returned incomplete GPU metrics." });
+        return;
+      }
+      finish({
+        available: true,
+        name,
+        totalMiB: values[0],
+        usedMiB: values[1],
+        utilizationPercent: values[2],
+      });
+    });
+  });
+}
+
+async function getPerformanceDiagnostics() {
+  const start = Date.now();
+  const cpuBefore = cpuTimesSnapshot();
+  const processCpuBefore = process.cpuUsage();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const elapsedMs = Date.now() - start;
+  const cpuAfter = cpuTimesSnapshot();
+  const processCpuAfter = process.cpuUsage(processCpuBefore);
+  const totalCpuDelta = Object.values(cpuAfter).reduce((total, value) => total + value, 0) -
+    Object.values(cpuBefore).reduce((total, value) => total + value, 0);
+  const idleCpuDelta = cpuAfter.idle - cpuBefore.idle;
+  const appProcesses = app.getAppMetrics().map((metric) => ({
+    type: metric.type,
+    pid: metric.pid,
+    cpuPercent: Number(metric.cpu.percentCPUUsage.toFixed(1)),
+    workingSetMiB: Number((metric.memory.workingSetSize / 1024).toFixed(1)),
+  }));
+  const gpu = await queryNvidiaGpu();
+  return {
+    measuredAt: new Date().toISOString(),
+    systemCpuPercent: totalCpuDelta > 0
+      ? Number((100 * (1 - idleCpuDelta / totalCpuDelta)).toFixed(1))
+      : 0,
+    mainProcessCpuPercent: Number((
+      100 * (processCpuAfter.user + processCpuAfter.system) / (elapsedMs * 1000)
+    ).toFixed(1)),
+    systemMemoryMiB: {
+      total: Math.round(os.totalmem() / (1024 * 1024)),
+      used: Math.round((os.totalmem() - os.freemem()) / (1024 * 1024)),
+    },
+    appProcesses,
+    gpu,
+  };
+}
+
 function registerIPC() {
   ipcMain.handle("jarvis:execute", (event, command, stream) => {
     if (!isTrustedWindow(event)) {
@@ -421,6 +546,18 @@ function registerIPC() {
       state: voiceState,
       detail: voiceDetail,
       runtime: voiceAvailability,
+      whisperModels: await voiceRuntime.modelAvailability(),
+      hinglishLanguage: voiceRuntime.hinglishLanguage,
+    };
+  });
+  ipcMain.handle("jarvis:voice-setting", async (event, key, value) => {
+    checkTrustedWindow(event);
+    const updated = await updateVoiceSetting(key, value);
+    return {
+      ...updated,
+      runtime: await voiceRuntime.availability(),
+      whisperModels: await voiceRuntime.modelAvailability(),
+      hinglishLanguage: voiceRuntime.hinglishLanguage,
     };
   });
   ipcMain.handle("jarvis:voice-control", async (event, action) => {
@@ -438,6 +575,10 @@ function registerIPC() {
   ipcMain.handle("jarvis:tasks", async (event) => {
     checkTrustedWindow(event);
     return sendAssistantRequest({ command: "tasks" });
+  });
+  ipcMain.handle("jarvis:diagnostics", async (event) => {
+    checkTrustedWindow(event);
+    return getPerformanceDiagnostics();
   });
   ipcMain.on("jarvis:voice-state", (event, update) => {
     if (!mainWindow || event.sender !== mainWindow.webContents ||
@@ -513,6 +654,17 @@ if (singleInstanceLock) {
       path.resolve(__dirname, "..", ".env"),
       path.join(__dirname, ".env"),
     ]);
+    if (savedWhisperModel) {
+      try {
+        await voiceRuntime.selectModel(voicePreferences.whisperModel);
+      } catch (error) {
+        console.error(error.message);
+        voicePreferences.whisperModel = voiceRuntime.selectedModel;
+        setVoiceState("Error", error.message);
+      }
+    } else {
+      voicePreferences.whisperModel = voiceRuntime.selectedModel;
+    }
     voiceAvailability = await voiceRuntime.availability();
     if (!voiceAvailability.available) {
       setVoiceState("Offline", voiceAvailability.message);

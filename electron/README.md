@@ -21,7 +21,8 @@ login by default.
 ## Voice
 
 The installer installs the CPU-optimized `whisper-cli.exe` and multilingual
-base model to `%APPDATA%\JARVIS\voice`. If a local Windows bundle is present in
+Whisper Base model to `%APPDATA%\JARVIS\voice` by default. Choose Small or both
+models when needed. If a local Windows bundle is present in
 the ignored repository `whisper\Release` and `whisper\models` folders, it uses
 that bundle; otherwise it builds the pinned official whisper.cpp v1.9.6 source.
 The source-build path requires CMake and Visual Studio Build Tools with the
@@ -30,6 +31,8 @@ The source-build path requires CMake and Visual Studio Build Tools with the
 ```powershell
 Set-Location electron
 .\install-whisper.ps1
+# Or install both selectable models (about 600 MiB total).
+.\install-whisper.ps1 -Model Both
 ```
 
 If PowerShell blocks the script, run it with a process-scoped policy override:
@@ -38,15 +41,32 @@ If PowerShell blocks the script, run it with a process-scoped policy override:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-whisper.ps1
 ```
 
-The script is repeatable; use `.\install-whisper.ps1 -Force` to rebuild from
-source and redownload. It uses four CPU build workers and a four-thread transcription
-default to leave resources available for Ollama. Override the paths or thread
-count with `JARVIS_WHISPER_PATH`, `JARVIS_WHISPER_MODEL`, and
-`JARVIS_WHISPER_THREADS` in the repository-root `.env` file (see
-[`.env.example`](../.env.example)). The multilingual `ggml-base.bin` supports
-English and Hindi; Hinglish uses Whisper's automatic language detection. JARVIS
-speaks through Windows SAPI. Install a Hindi speech voice in Windows language
-settings if needed; set `JARVIS_SAPI_VOICE` to an exact voice name to pin one.
+The script is repeatable; use `.\install-whisper.ps1 -Model Small` to install
+only Small, `-Model Both` for both, or `-Force` to rebuild and redownload the
+requested model(s). Whisper uses four CPU threads by default. Select Base or
+Small in **Voice and communication settings**; Small is available after it is
+installed. Set `JARVIS_WHISPER_MODEL=base|small`,
+`JARVIS_WHISPER_BASE_MODEL`, `JARVIS_WHISPER_SMALL_MODEL`, and
+`JARVIS_WHISPER_THREADS` in the repository-root `.env` file to configure the
+runtime (see [`.env.example`](../.env.example)). The model picker preference is
+saved locally. English and Hindi are pinned to their selected language;
+Hinglish uses Hindi as its constrained default. Set
+`JARVIS_WHISPER_HINGLISH_LANGUAGE=auto` only if mixed-script recognition needs
+automatic detection. Whisper's no-speech, decoder-confidence, and non-speech
+token filters are enabled; local VAD rejects silence and steady-tone input and
+repeated or invalid transcripts are ignored. These filters reduce background
+music and hallucinations but do not replace a real microphone test.
+
+JARVIS speaks complete sentences as they arrive instead of waiting for the
+whole answer. The sentence queue is bounded; overflow or SAPI errors are shown
+without losing the on-screen response. Speaking stops and pending sentences are
+cleared when the existing 180 ms barge-in detector recognizes an interruption.
+The final response is not spoken a second time after streamed sentences.
+Tool-call arguments are not spoken; a tool-result response is spoken after the
+tool has completed and existing authorization/confirmation checks have passed.
+JARVIS speaks through Windows SAPI. Install a Hindi speech voice in Windows
+language settings if needed; set `JARVIS_SAPI_VOICE` to an exact voice name to
+pin one.
 
 Install Ollama and its smaller tool-capable model for a 16 GB RAM / 4 GB VRAM
 system:
@@ -61,8 +81,9 @@ application is not running, start it with `ollama serve`. Ollama chooses GPU
 offload based on available VRAM. Avoid loading other models concurrently when
 memory is constrained.
 
-Select English, Hindi, or Hinglish, grant microphone access, and leave listening
-enabled. Say **“Hey Jarvis”** or **“हे जार्विस”** to start a conversation
+Select English, Hindi, or Hinglish, choose an input device, grant microphone
+access, and leave listening enabled. The input meter shows the current local
+audio level. Say **“Hey Jarvis”** or **“हे जार्विस”** to start a conversation
 session; natural follow-ups do not need another wake phrase. The session returns
 to standby after 45 seconds without speech. JARVIS resumes listening after its
 spoken response unless listening is paused or the microphone is muted. Say
@@ -77,9 +98,22 @@ and model. Microphone and SAPI behavior still depends on Windows privacy
 settings and installed voices. While speaking, JARVIS stops playback after
 detecting 180 ms of sustained microphone speech (with browser echo cancellation
 enabled), allowing you to interrupt without waiting for transcription to finish.
-Natural-language answers stream into the dashboard; speech playback starts when
-the completed answer is available, so unverified partial tool responses are not
-spoken.
+Utterances are buffered until a silence boundary (up to 30 seconds), then
+transcribed from a temporary WAV file. No raw microphone recordings are retained
+by default.
+
+**Voice and communication settings** persist in the local JARVIS preferences:
+context-aware completion suggestions, task/reminder speech, do-not-disturb,
+quiet hours, and a suggestion cooldown. Quiet hours and do-not-disturb keep
+completion and reminder updates visible but silent. Suggestions only ask
+whether you want a relevant next step; they never execute an action. Sensitive
+actions continue to use the existing permission and confirmation controls.
+
+Use **Performance diagnostics → Measure now** for a one-time system CPU/RAM,
+Electron-process, NVIDIA GPU/VRAM snapshot. It does not poll in the background.
+Voice latency readings report Whisper transcription, first AI text token, and
+first SAPI speech-start times for the latest voice request. These readings are
+local and are not uploaded.
 
 The voice layer invokes the Go assistant's existing supported commands. It does
 not interpret or run arbitrary shell commands.
@@ -162,23 +196,37 @@ Set-Location electron
 npm test
 Set-Location ..\backend
 go test ./...
+Set-Location ..\electron
+node --check .\renderer.js
+node --check .\main.cjs
+node --check .\voice-runtime.cjs
+node --check .\voice-core.js
+git diff --check
 ```
 
-For a live test, make sure Whisper and Ollama are installed and running, then:
+Install and configure for a live test in PowerShell:
 
 ```powershell
 Set-Location electron
+.\install-whisper.ps1 -Model Both
+$env:JARVIS_WHISPER_MODEL = "base"
+$env:JARVIS_WHISPER_THREADS = "4"
+$env:JARVIS_WHISPER_HINGLISH_LANGUAGE = "hi"
+ollama pull qwen2.5:3b
 npm start
 ```
 
-In JARVIS, grant microphone access, select English, and say **“Hey Jarvis, tell
-me a short greeting.”** Wait for the spoken reply, then ask a follow-up without
-the wake phrase. Repeat with Hindi and Hinglish selected. While a response is
-being spoken, begin speaking to test interruption; also test silence returning
-the assistant to standby, and pause/mute from the dashboard or tray. These
-device-dependent checks must be completed on the target Windows laptop; passing
-automated tests alone does not verify microphone, echo cancellation, SAPI voice,
-or real-time behavior.
+In JARVIS, select the Base model and a microphone, confirm the meter responds,
+then say **“Hey Jarvis, tell me a short greeting.”** Ask a follow-up without the
+wake phrase and confirm the first sentence is spoken before the answer finishes
+appearing. Repeat with Hindi and Hinglish, then select Small and repeat. Speak
+over an answer to test barge-in and queue cancellation. Test silence, background
+music, quiet hours, do-not-disturb, task/reminder announcements, and pause/mute
+from the dashboard and tray. Use **Measure now** while Ollama is responding to
+capture GPU/VRAM use and review the latency readings. These device-dependent
+checks must be completed on the target Windows laptop; automated and generated
+audio tests alone do not verify its microphone, audible SAPI output, or
+continuous two-way conversation.
 
 ## Permissions
 
