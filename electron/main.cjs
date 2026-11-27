@@ -7,6 +7,18 @@ const path = require("node:path");
 const { VoiceRuntime } = require("./voice-runtime.cjs");
 const voiceCore = require("./voice-core.js");
 const { appendVoiceDiagnostic } = require("./voice-diagnostics.cjs");
+const fsSync = require("node:fs");
+
+// #region agent log
+function agentDebugLog(hypothesisId, location, message, data) {
+  try {
+    fsSync.appendFileSync(
+      "e:\\USER\\OneDrive\\Desktop\\assistend\\.cursor\\debug-a054d2.log",
+      `${JSON.stringify({ sessionId: "a054d2", runId: "pre-fix", hypothesisId, location, message, data, timestamp: Date.now() })}\n`,
+    );
+  } catch {}
+}
+// #endregion
 
 const backendDirectory = path.resolve(__dirname, "..", "backend");
 let mainWindow;
@@ -213,13 +225,31 @@ function checkTrustedWindow(event) {
 
 async function transcribeAudio(event, audio, language) {
   checkTrustedWindow(event);
+  // #region agent log
+  agentDebugLog("B", "main.cjs:transcribeAudio", "transcription started", {
+    language,
+    audioBytes: audio?.byteLength || audio?.length || 0,
+    model: voiceRuntime?.selectedModel || "",
+    modelPathExists: Boolean(voiceRuntime?.modelPath) && fsSync.existsSync(voiceRuntime.modelPath),
+    binaryExists: Boolean(voiceRuntime?.binaryPath) && fsSync.existsSync(voiceRuntime.binaryPath),
+  });
+  // #endregion
   try {
     const transcript = await voiceRuntime.transcribe(audio, language);
+    // #region agent log
+    agentDebugLog("B", "main.cjs:transcribeAudio", "transcription finished", {
+      transcriptChars: typeof transcript === "string" ? transcript.length : 0,
+      transcriptPreview: typeof transcript === "string" ? transcript.slice(0, 120) : "",
+    });
+    // #endregion
     if (!transcript) {
       return "";
     }
     return transcript;
   } catch (error) {
+    // #region agent log
+    agentDebugLog("B", "main.cjs:transcribeAudio", "transcription failed", { error: error.message });
+    // #endregion
     setVoiceState("Error", error.message);
     throw error;
   }
@@ -259,6 +289,32 @@ function rejectPendingRequests(message) {
   }
 }
 
+function resolveGoExecutable() {
+  const executableName = process.platform === "win32" ? "go.exe" : "go";
+  const candidates = [];
+  if (process.env.GOROOT) {
+    candidates.push(path.join(process.env.GOROOT, "bin", executableName));
+  }
+  if (process.platform === "win32") {
+    const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+    const localAppData = process.env.LOCALAPPDATA || "";
+    const userProfile = process.env.USERPROFILE || "";
+    candidates.push(
+      path.join(programFiles, "Go", "bin", "go.exe"),
+      path.join(programFilesX86, "Go", "bin", "go.exe"),
+      path.join(localAppData, "JARVIS", "go", "bin", "go.exe"),
+      path.join(userProfile, "sdk", "go", "bin", "go.exe"),
+    );
+  }
+  for (const directory of (process.env.PATH || "").split(path.delimiter)) {
+    if (directory) {
+      candidates.push(path.join(directory, executableName));
+    }
+  }
+  return candidates.find((candidate) => candidate && fsSync.existsSync(candidate)) || "";
+}
+
 function startAssistant() {
   if (assistantProcess) {
     return assistantProcess;
@@ -268,13 +324,35 @@ function startAssistant() {
     restartTimer = undefined;
   }
 
+  const goExecutable = resolveGoExecutable();
+  // #region agent log
+  agentDebugLog("D", "main.cjs:startAssistant", "resolving go executable", {
+    goExecutable,
+    found: Boolean(goExecutable),
+    backendDirectory,
+  });
+  // #endregion
+  if (!goExecutable) {
+    const error = new Error("Go is not installed. JARVIS looked in Program Files and %LOCALAPPDATA%\\JARVIS\\go.");
+    rejectPendingRequests(`Could not start the Go assistant: ${error.message}`);
+    setVoiceState("Error", `Go assistant failed to start: ${error.message}`);
+    scheduleAssistantRestart();
+    return undefined;
+  }
+
+  const goBin = path.dirname(goExecutable);
   const child = spawn(
-    "go",
+    goExecutable,
     ["run", "./cmd/jarvis", "-stdio", "-workspace", workspaceDirectory],
     {
       cwd: backendDirectory,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: {
+        ...process.env,
+        GOROOT: path.resolve(goBin, ".."),
+        PATH: `${goBin}${path.delimiter}${process.env.PATH || ""}`,
+      },
     },
   );
   assistantProcess = child;
@@ -317,11 +395,19 @@ function startAssistant() {
     }
   });
 
+  let backendStderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (message) => {
+    backendStderr = (backendStderr + message).slice(-500);
     console.error(`[JARVIS backend] ${message.trimEnd()}`);
   });
   child.on("error", (error) => {
+    // #region agent log
+    agentDebugLog("D", "main.cjs:startAssistant", "go assistant process error", {
+      error: error.message,
+      goExecutable,
+    });
+    // #endregion
     if (assistantProcess === child) {
       assistantProcess = undefined;
       rejectPendingRequests(`Could not start the Go assistant: ${error.message}`);
@@ -330,6 +416,12 @@ function startAssistant() {
     }
   });
   child.on("close", (code) => {
+    // #region agent log
+    agentDebugLog("D", "main.cjs:startAssistant", "go assistant exited", {
+      code,
+      stderrTail: backendStderr.trim(),
+    });
+    // #endregion
     if (assistantProcess === child) {
       assistantProcess = undefined;
       rejectPendingRequests(`The Go assistant stopped${code === null ? "" : ` (exit ${code})`}.`);
@@ -340,6 +432,12 @@ function startAssistant() {
     }
   });
   child.once("spawn", () => {
+    // #region agent log
+    agentDebugLog("D", "main.cjs:startAssistant", "go assistant spawned", {
+      pid: child.pid,
+      goExecutable,
+    });
+    // #endregion
     restartDelay = 1000;
   });
   return child;
@@ -347,6 +445,9 @@ function startAssistant() {
 
 function sendAssistantRequest(request, onStream) {
   const child = startAssistant();
+  if (!child) {
+    return Promise.reject(new Error("Could not start the Go assistant: Go is not installed."));
+  }
   return new Promise((resolve, reject) => {
     pendingRequests.push({ resolve, reject, onStream });
     child.stdin.write(`${JSON.stringify(request)}\n`, (error) => {
@@ -363,20 +464,44 @@ function sendAssistantRequest(request, onStream) {
 }
 
 async function executeCommand(command, stream = false) {
+  // #region agent log
+  agentDebugLog("D", "main.cjs:executeCommand", "backend command started", {
+    commandPreview: typeof command === "string" ? command.slice(0, 120) : "",
+    stream,
+    assistantRunning: Boolean(assistantProcess),
+    pendingRequests: pendingRequests.length,
+  });
+  // #endregion
   if (typeof command !== "string" || command.trim() === "" || command.length > 4096) {
     throw new Error("Enter a command up to 4096 characters long.");
   }
   if (typeof stream !== "boolean") {
     throw new Error("The streaming option must be a boolean.");
   }
-  const result = await sendAssistantRequest(
-    { command, stream },
-    stream ? (delta) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send("jarvis:assistant-delta", { delta });
-      }
-    } : undefined,
-  );
+  let result;
+  try {
+    result = await sendAssistantRequest(
+      { command, stream },
+      stream ? (delta) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("jarvis:assistant-delta", { delta });
+        }
+      } : undefined,
+    );
+  } catch (error) {
+    // #region agent log
+    agentDebugLog("D", "main.cjs:executeCommand", "backend command failed", { error: error.message });
+    // #endregion
+    throw error;
+  }
+  // #region agent log
+  agentDebugLog("D", "main.cjs:executeCommand", "backend command returned", {
+    hasOutput: Boolean(result?.output),
+    outputPreview: typeof result?.output === "string" ? result.output.slice(0, 160) : "",
+    needsConfirmation: Boolean(result?.confirmation),
+    hasError: Boolean(result?.error),
+  });
+  // #endregion
   if (!result.confirmation) {
     return result;
   }
@@ -665,6 +790,7 @@ if (singleInstanceLock) {
     const voiceDirectory = path.join(app.getPath("userData"), "voice");
     voiceRuntime = new VoiceRuntime({
       voiceDirectory,
+      keepModelLoaded: true,
       onState: (state) => {
         const nextState = state === "Speaking"
           ? state
@@ -681,14 +807,35 @@ if (singleInstanceLock) {
       try {
         await voiceRuntime.selectModel(voicePreferences.whisperModel);
       } catch (error) {
-        console.error(error.message);
-        voicePreferences.whisperModel = voiceRuntime.selectedModel;
-        setVoiceState("Error", error.message);
+        const fallback = voicePreferences.whisperModel === "small" ? "base" : "small";
+        try {
+          await voiceRuntime.selectModel(fallback);
+          console.error(error.message);
+          voicePreferences.whisperModel = fallback;
+        } catch (fallbackError) {
+          console.error(error.message);
+          console.error(fallbackError.message);
+          voicePreferences.whisperModel = voiceRuntime.selectedModel;
+          setVoiceState("Error", error.message);
+        }
       }
     } else {
       voicePreferences.whisperModel = voiceRuntime.selectedModel;
     }
+    void voiceRuntime.prewarmWhisper();
     voiceAvailability = await voiceRuntime.availability();
+    // #region agent log
+    agentDebugLog("B", "main.cjs:startup", "voice runtime availability", {
+      available: voiceAvailability.available,
+      message: voiceAvailability.message,
+      binaryPath: voiceRuntime.binaryPath,
+      modelPath: voiceRuntime.modelPath,
+      binaryExists: fsSync.existsSync(voiceRuntime.binaryPath),
+      modelExists: fsSync.existsSync(voiceRuntime.modelPath),
+      listeningEnabled: voicePreferences.listeningEnabled,
+      muted: voicePreferences.muted,
+    });
+    // #endregion
     if (!voiceAvailability.available) {
       setVoiceState("Offline", voiceAvailability.message);
     }

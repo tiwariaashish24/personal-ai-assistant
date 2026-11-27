@@ -124,7 +124,7 @@ func newAIAssistant(cfg *config.Config) *aiAssistant {
 		return &aiAssistant{configErr: errors.New("OPENAI_API_KEY is required when JARVIS_AI_PROVIDER=openai")}
 	}
 	return &aiAssistant{
-		client:   &http.Client{Timeout: 75 * time.Second},
+		client:   &http.Client{Timeout: 20 * time.Second},
 		endpoint: strings.TrimRight(baseURL, "/") + "/chat/completions",
 		apiKey:   apiKey,
 		model:    model,
